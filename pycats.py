@@ -3,6 +3,9 @@ import time
 import pytz
 from datetime import datetime, timedelta
 from logging import debug, error, info
+import re
+import string
+
 #
 # Create the DAO using a List of cassandra hosts and a KeySpace
 # The KeySpace must exist on the cassandra cluster.
@@ -10,7 +13,7 @@ from logging import debug, error, info
 #
 # The KeySpace must have a column family created as follows:
 #
-# CREATE COLUMNFAMILY HourlyFloat (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=float;
+# CREATE COLUMNFAMILY HourlyFloat (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=blob;
 #
 ####################################################################################
 
@@ -19,15 +22,26 @@ CACHE_TTL = 8*60*60 # 8 hours
 # Sorry we are not Y10K compatible, just need something surely beyond anything reasonable
 MAX_TIME = datetime.strptime('2100-01-01T01:59:59', '%Y-%m-%dT%H:%M:%S')
 
-class FloatMetricDTO():
-    def __init__(self, source_id, timestamp, metric_name, value):
+class TimestampedDataDTO():
+    def __init__(self, source_id, timestamp, data_name, data_value):
         self.source_id = source_id
         self.timestamp = timestamp
-        self.metric_name = metric_name
-        self.value = value
+        self.data_name = data_name
+        self.data_value = data_value
+
+class StringIndexDTO():
+    def __init__(self, index_key, timestamp, row_key_reference):
+        self.row_key = index_key
+        self.timestamp = timestamp
+        self.row_key_reference = row_key_reference
+
+    def __unicode__(self):
+        return u'%s for %s on time %s' % (self.row_key, self.row_key_reference, self.timestamp)
 
 class TimeSeriesCassandraDao():
-    HOURLY_FLOAT_COLUMN_FAMILY_NAME = 'HourlyFloat'
+    HOURLY_DATA_COLUMN_FAMILY_NAME = 'HourlyTimestampedData'
+    STRING_INDEX_COLUMN_FAMILY_NAME = 'StringIndex'
+    string_indexer = None
 
     def __init__(self, cassandra_hosts, key_space, cache=None, warm_up_cache_shards=0):
         self.__cassandra_hosts = cassandra_hosts
@@ -37,13 +51,14 @@ class TimeSeriesCassandraDao():
         self.cache_hits = 0
         self.daily_gets = 0
         self.__warm_up_cache_shards = warm_up_cache_shards
+        self.string_indexer = StringIndexer()
 
-    def __get_hourly_float_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.HOURLY_FLOAT_COLUMN_FAMILY_NAME)
+    def __get_hourly_data_cf(self):
+        return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME)
 
-    def __build_row_key_for_hourly(self, source_id, metric_name, utc_datetime):
+    def __build_row_key_for_hourly(self, source_id, data_name, utc_datetime):
         time_part = utc_datetime.strftime('%Y%m%d%H')
-        return str(source_id+'-'+metric_name+'-'+time_part)
+        return str(source_id+'-'+data_name+'-'+time_part)
 
     # Convert datetime object to millisecond precision unix epoch
     def __unix_time_millis(self, dt):
@@ -64,6 +79,7 @@ class TimeSeriesCassandraDao():
             # Assume datetime was in UTC if no timezone info exists
             return a_datetime
 
+    # TODO: bleeeeh.. how ugly, can some just optimize this???
     def __datetime_is_in_now_hour(self, a_datetime):
         now = datetime.utcnow()
         if now.year != a_datetime.year:
@@ -76,7 +92,7 @@ class TimeSeriesCassandraDao():
             return False
         return True
 
-    def __get_hourly_float_cached(self, row_key, a_datetime):
+    def __get_hourly_data_cached(self, row_key, a_datetime):
         if not self.__datetime_is_in_now_hour(a_datetime) and self.cache:
             hourly_data = self.cache.get(row_key)
             if hourly_data:
@@ -87,13 +103,13 @@ class TimeSeriesCassandraDao():
         # Requested time was for the current hour shard (or no cache is used), go fetch then
         self.daily_gets+=1
         # TODO: improve, use pycassa.multiget() if row_key argument is a list !!!
-        hourly_data = self.__get_hourly_float_cf().get(row_key, column_reversed=False, column_count=MAX_COLUMNS).items()
+        hourly_data = self.__get_hourly_data_cf().get(row_key, column_reversed=False, column_count=MAX_COLUMNS).items()
         if self.cache:
             # add means, insert only if not existing in cache
             self.cache.add(row_key, hourly_data, CACHE_TTL)
         return hourly_data
 
-    # TODO: improve, not good to iterate over the dict
+    # TODO: dumb stuff, use get_slice of the pycassa library instead FFS!!!
     def __get_slice_of_shard(self, shard, start_datetime, end_datetime):
         truncated_shard = list()
 
@@ -114,13 +130,18 @@ class TimeSeriesCassandraDao():
             microseconds=tm.microsecond)
         return tm
 
-    def __build_pycassa_insert_tuple(self, float_metric_dto):
-        utc_datetime = self.__datetime_to_utc(float_metric_dto.timestamp)
-
-        row_key = self.__build_row_key_for_hourly(float_metric_dto.source_id, float_metric_dto.metric_name, utc_datetime)
+    def __build_pycassa_insert_tuple(self, dto):
+        utc_datetime = self.__datetime_to_utc(dto.timestamp)
+        row_key = self.__build_row_key_for_hourly(dto.source_id, dto.data_name, utc_datetime)
 
         column_name = utc_datetime
-        column_value = float(float_metric_dto.value)
+
+        # Note: if you dont want to store it as unicode string, cast it to float
+        # for example, and make sure to create the column family with 'float' as default validator
+        # see http://cassandra.apache.org/doc/cql/CQL.html#CREATECOLUMNFAMILY and
+        # http://cassandra.apache.org/doc/cql/CQL.html#storageTypes
+        # You need a float/int validator to use conditional queries (ie greater than.. )
+        column_value = u'%s' % dto.data_value
 
         return (row_key, {column_name : column_value})
 
@@ -128,18 +149,18 @@ class TimeSeriesCassandraDao():
     ## Float metric interface
     ##
     ######################################################
-    def insert_hourly_float_metric(self, float_metric_dto):
-        tuple = self.__build_pycassa_insert_tuple(float_metric_dto)
-        return self.__get_hourly_float_cf().insert(tuple[0], tuple[1])
+    def insert_timestamped_data(self, timestamped_data_dto):
+        tuple = self.__build_pycassa_insert_tuple(timestamped_data_dto)
+        return self.__get_hourly_data_cf().insert(tuple[0], tuple[1])
 
         # during development only
         #print u'%s : {%s : %s}' % (row_key, column_name, column_value)
 
-    def batch_insert_hourly_float_metric(self, list_of_float_metric_dtos):
+    def batch_insert_timestamped_data(self, list_of_timestamped_data_dtos):
         list_of_insert_tuples = dict()
 
-        for float_metric_dto in list_of_float_metric_dtos:
-            tuple = self.__build_pycassa_insert_tuple(float_metric_dto)
+        for dto in list_of_timestamped_data_dtos:
+            tuple = self.__build_pycassa_insert_tuple(dto)
             row_key = tuple[0]
             col_name_value_pairs = list_of_insert_tuples.get(row_key, None)
             if not col_name_value_pairs:
@@ -147,16 +168,15 @@ class TimeSeriesCassandraDao():
             col_name_value_pairs.update(tuple[1])
             list_of_insert_tuples[row_key] = col_name_value_pairs
 
-        self.__get_hourly_float_cf().batch_insert(list_of_insert_tuples)
+        self.__get_hourly_data_cf().batch_insert(list_of_insert_tuples)
 
     # Load data for given metric_name, a start and end datetime and source_id
-    def get_hourly_float_data_range(self, source_id, metric_name, start_datetime, end_datetime):
+    def get_timetamped_data_range(self, source_id, metric_name, start_datetime, end_datetime):
 
         # TODO: check requested range, or check how many shards we will request
         # should probably put a limit here
 
         datetimes = list()
-        curr_datetime = start_datetime
 
         # TODO: check out column slice usage
 
@@ -174,7 +194,7 @@ class TimeSeriesCassandraDao():
             row_key = self.__build_row_key_for_hourly(source_id, metric_name, a_datetime)
             try:
                 debug('trying %s' % (row_key))
-                a_shard = self.__get_hourly_float_cached(row_key, a_datetime)
+                a_shard = self.__get_hourly_data_cached(row_key, a_datetime)
                 shards.append(a_shard)
             except Exception, e:
                 # Not found, or other error, try next date
@@ -206,67 +226,65 @@ class TimeSeriesCassandraDao():
 
         return result
 
-    def try_warm_up_hourly_float_metric_cache(self, source_id, a_datetime, metric_name):
+    def try_warm_up_hourly_timestamped_data_cache(self, source_id, a_datetime, metric_name):
         if self.cache and self.__warm_up_cache_shards > 0:
             for offs in range(1,self.__warm_up_cache_shards+1):
                 earlier_datetime = a_datetime-timedelta(hours=offs)
                 earlier_key = self.__build_row_key_for_hourly(source_id,metric_name, earlier_datetime)
-                self.__get_hourly_float_cached(earlier_key, earlier_datetime)
+                self.__get_hourly_data_cached(earlier_key, earlier_datetime)
 
-    def get_hourly_float(self, source_id, a_datetime, metric_name):
+    def get_timestamped_data(self, source_id, a_datetime, metric_name):
         row_key = self.__build_row_key_for_hourly(source_id,metric_name, a_datetime)
 
-        result = self.__get_hourly_float_cached(row_key, a_datetime)
+        result = self.__get_hourly_data_cached(row_key, a_datetime)
 
         return result
 
 
-# The KeySpace must have a column family created as follows:
+# A simple example of an indexer for the bucketed storage above, useful if
+# you are storing strings in the buckets and want to make them searchable
 #
-# CREATE COLUMNFAMILY IndexedStrings (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=text;
+# Idea: The TimeSeriesCassandraDao class stores any kind of data
+# based on a row key that is assembled. Any row represent data during
+# a specific hour, as explained above.
 #
-####################################################################################
-import re
-import string
-
-class TimeStampedStringDTO():
-    def __init__(self, source_id, timestamp, string):
-        self.source_id = source_id
-        self.timestamp = timestamp
-        self.string = string
-
-class StringIndexDTO():
-    def __init__(self, index_key, timestamp, key_to_string):
-        self.row_key = index_key
-        self.timestamp = timestamp
-        self.key_to_string = key_to_string
-
-    def __unicode__(self):
-        return u'%s for %s on time %s' % (self.row_key, self.key_to_string, self.timestamp)
-
-class IndexedStringsCassandraDAO():
-    TIME_STAMPED_STRING_COLUMN_FAMILY_NAME = 'TimeStampedString'
+# The indexer class can then create aditional keys in another column family
+# named 'StringIndex', representing references to the data stored in the buckets:
+#
+# Say we want to store this data, as a TimestampedDataDTO()
+#  timestamp = 2012-12-24T18:12:33
+#  source_id = 'the_kids'
+#  data_name = 'log_info'
+#  data_value = 'Santa is comming'
+#
+# The method __build_row_key_for_hourly() would return a row key for an hourly bucket
+#  data_row_key = 2012122418-the_kids-data_name
+# The column name is the timestamp and the value is of course the data_value
+#
+# Now, a typical scenario is to search for 'santa' or 'comming' given
+# we want to search for stuff said by 'the_kids' with 'log_info' kind
+# of messages. We kan then store a new column in the 'StringIndex'
+# column family using the follwing row_key
+#
+# row_key = 'the_kids.log_info.santa' and add another column and value would be
+# column_name = 2012-12-24T18:12:33
+# column_value = 2012122418-the_kids-data_name
+#
+# So, a query for santa would yield all columns on row
+#
+# Using the column_value(s), we would query the Hourly buckets and ask for
+# the data on the corresponding 'column_name' (which is the timestamp).
+#
+# A caveat: to be able to sarch not only for santa we would also insert
+# indexes for 'santa', 'is', 'comming', 'santa is', 'is comming' and 'santa is comming'.
+# The work of creating that array of indexable substrings is taken care of
+# by the class below
+#
+#
+class StringIndexer():
     white_list = string.letters + string.digits + ' '
     index_depth = 5
     #default_ttl = 60*60*24*30 # 30 days TTL as default
-
-    def __init__(self, cassandra_hosts, key_space, index_depth=5, ttl=None, cache=None, warm_up_cache_shards=0):
-        self.__cassandra_hosts = cassandra_hosts
-        self.__key_space = key_space
-        self.__pool = pycassa.ConnectionPool(self.__key_space, self.__cassandra_hosts)
-        self.index_depth = index_depth
-        self.cache = cache
-        self.cache_hits = 0
-        self.daily_gets = 0
-        self.ttl = ttl
-        self.__warm_up_cache_shards = warm_up_cache_shards
-
-    def __get_timestamped_string_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.TIME_STAMPED_STRING_COLUMN_FAMILY_NAME)
-
-
-    # TODO: consider breaking out the indexing methods to separate class
-    # to make the string storage be independent of indexing method
 
     # Takes a string and returns a clean string of lower-case words only
     # Makes a good base to create index from
@@ -295,22 +313,21 @@ class IndexedStringsCassandraDAO():
                 result.append('_'.join(current_words))
         return result
 
-    def build_index_key(self, source_id, substring):
-        return source_id + '.' + substring
+    def build_index_key(self, source_id, data_name, substring):
+        return source_id + '-' + data_name + '-' + substring
 
-    def build_indexes_from_string_dto(self, dto, key_to_string_dto):
-        indexable_string = self. make_indexable_string(dto.string)
+    def build_indexes_from_string_dto(self, dto, row_key_reference):
+        indexable_string = self. make_indexable_string(dto.data_value)
 
         substrings = self.build_substrings(indexable_string, self.index_depth)
 
         index_dtos = []
         for substring in substrings:
-            index_key = self.build_index_key(dto.source_id, substring)
-            index_dto = StringIndexDTO(index_key, dto.timestamp, key_to_string_dto)
+            index_key = self.build_index_key(dto.source_id, dto.data_name, substring)
+            index_dto = StringIndexDTO(index_key, dto.timestamp, row_key_reference)
             index_dtos.append(index_dto)
 
         return index_dtos
-
 
     def __datetime_to_utc(self, a_datetime):
         if a_datetime.tzinfo:
@@ -320,25 +337,7 @@ class IndexedStringsCassandraDAO():
             # Assume datetime was in UTC if no timezone info exists
             return a_datetime
 
-    # TODO: consider storing in daily-chunks similar to the Floats in the class above
     def __build_row_key_for_timestamped_string(self, source_id, utc_datetime):
 #        time_part = utc_datetime.strftime('%Y%m%d')
 #        return str(source_id+'-'+time_part)
         return source_id
-
-    def __build_pycassa_insert_tuple(self, time_stamped_string_dto):
-        utc_datetime = self.__datetime_to_utc(time_stamped_string_dto.timestamp)
-
-        row_key = self.__build_row_key_for_timestamped_string(time_stamped_string_dto.source_id, utc_datetime)
-
-        column_name = utc_datetime
-        column_value = u'%s' % time_stamped_string_dto.string
-
-        return (row_key, {column_name : column_value})
-
-    def store_timestamped_string_dto(self, dto):
-        tuple = self.__build_pycassa_insert_tuple(dto)
-        self.__get_timestamped_string_cf().insert(tuple[0], tuple[1])
-
-        # create indexes, note using the datetime as key, upon load, we request the log that has that same timestamp
-        index_dtos = self.build_indexes_from_string_dto(dto, dto.timestamp)
