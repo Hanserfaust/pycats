@@ -1,0 +1,4 @@
+pycassa==1.8.0-3
+pytz==2012j
+thrift==0.9.0
+wsgiref==0.1.2

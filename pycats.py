@@ -30,13 +30,13 @@ class TimestampedDataDTO():
         self.data_value = data_value
 
 class StringIndexDTO():
-    def __init__(self, index_key, timestamp, row_key_reference):
-        self.row_key = index_key
+    def __init__(self, row_key, timestamp, data_value):
+        self.row_key = row_key
         self.timestamp = timestamp
-        self.row_key_reference = row_key_reference
+        self.data_value = data_value
 
     def __unicode__(self):
-        return u'%s for %s on time %s' % (self.row_key, self.row_key_reference, self.timestamp)
+        return u'%s for %s on time %s' % (self.row_key, self.data_value, self.timestamp)
 
 class TimeSeriesCassandraDao():
     HOURLY_DATA_COLUMN_FAMILY_NAME = 'HourlyTimestampedData'
@@ -55,6 +55,12 @@ class TimeSeriesCassandraDao():
 
     def __get_hourly_data_cf(self):
         return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME)
+
+    def __get_indexed_data_cf(self):
+        return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME)
+
+    def __get_string_index_cf(self):
+        return pycassa.ColumnFamily(self.__pool, self.STRING_INDEX_COLUMN_FAMILY_NAME)
 
     def __build_row_key_for_hourly(self, source_id, data_name, utc_datetime):
         time_part = utc_datetime.strftime('%Y%m%d%H')
@@ -130,7 +136,7 @@ class TimeSeriesCassandraDao():
             microseconds=tm.microsecond)
         return tm
 
-    def __build_pycassa_insert_tuple(self, dto):
+    def __build_pycassa_insert_list(self, dto):
         utc_datetime = self.__datetime_to_utc(dto.timestamp)
         row_key = self.__build_row_key_for_hourly(dto.source_id, dto.data_name, utc_datetime)
 
@@ -143,32 +149,62 @@ class TimeSeriesCassandraDao():
         # You need a float/int validator to use conditional queries (ie greater than.. )
         column_value = u'%s' % dto.data_value
 
-        return (row_key, {column_name : column_value})
+        return [row_key, column_name, column_value]
+
+    def __build_pycassa_insert_tuple(self, dto):
+        i_list = self.__build_pycassa_insert_list(dto)
+        return (i_list[0], {i_list[1] : i_list[2]})
 
     ##
-    ## Float metric interface
+    ## Data storage interface
     ##
     ######################################################
-    def insert_timestamped_data(self, timestamped_data_dto):
-        tuple = self.__build_pycassa_insert_tuple(timestamped_data_dto)
-        return self.__get_hourly_data_cf().insert(tuple[0], tuple[1])
 
-        # during development only
-        #print u'%s : {%s : %s}' % (row_key, column_name, column_value)
+    def insert_timestamped_data(self, timestamped_data_dto, create_indexes=False):
+        i_list = self.__build_pycassa_insert_list(timestamped_data_dto)
+
+        # Insert in hour bucket
+        result = self.__get_hourly_data_cf().insert(i_list[0], {i_list[1] : i_list[2]})
+
+        if create_indexes:
+            row_key = i_list[0]         # the key to reference
+
+            # Will return list of StringIndexDTO
+            list_of_string_index_dtos = self.string_indexer.build_indexes_from_timstamped_dto(timestamped_data_dto)
+
+            # Convert them to list of insertable tuples for batch insertion
+            insert_tuples = dict()
+            for dto in list_of_string_index_dtos:
+                row_key = dto.row_key
+                col_name_value_pair = {dto.timestamp : timestamped_data_dto.data_value}    # Note, all index dtos has same timestamp (which is the "column_name" for the timestamped data above)
+                insert_tuples[row_key] = col_name_value_pair
+
+            # And perform the insertion
+            self.__get_string_index_cf().batch_insert(insert_tuples)
+
+        return result
 
     def batch_insert_timestamped_data(self, list_of_timestamped_data_dtos):
-        list_of_insert_tuples = dict()
+        insert_tuples = dict()
 
         for dto in list_of_timestamped_data_dtos:
             tuple = self.__build_pycassa_insert_tuple(dto)
             row_key = tuple[0]
-            col_name_value_pairs = list_of_insert_tuples.get(row_key, None)
+            col_name_value_pairs = insert_tuples.get(row_key, None)
             if not col_name_value_pairs:
                 col_name_value_pairs = dict()
             col_name_value_pairs.update(tuple[1])
-            list_of_insert_tuples[row_key] = col_name_value_pairs
+            insert_tuples[row_key] = col_name_value_pairs
 
-        self.__get_hourly_data_cf().batch_insert(list_of_insert_tuples)
+        self.__get_hourly_data_cf().batch_insert(insert_tuples)
+
+    def get_timestamped_data_by_search_string(self, source_id, data_name, search_string):
+        substring = '_'.join(self.string_indexer.make_indexable_string(search_string).split())
+        return self.get_timestamped_data_by_index(source_id, data_name, substring)
+
+    def get_timestamped_data_by_index(self, source_id, data_name, substring):
+        index_row_key = self.string_indexer.build_index_row_key(source_id, data_name, substring)
+        return self.__get_string_index_cf().get(index_row_key, column_reversed=False, column_count=MAX_COLUMNS).items()
 
     # Load data for given metric_name, a start and end datetime and source_id
     def get_timetamped_data_range(self, source_id, metric_name, start_datetime, end_datetime):
@@ -301,8 +337,8 @@ class StringIndexer():
     # ie depth equals the maximum number of words in a substring
     #
     # Assume string can be split on space, depth is an integer >= 1
-    def build_substrings(self, string, depth):
-        result = []
+    def _build_substrings(self, string, depth):
+        result = set()
         words = string.split()
 
         for d in range(0, depth):
@@ -310,21 +346,23 @@ class StringIndexer():
                 if i+d+1 > len(words):
                     continue
                 current_words = words[i:i+d+1]
-                result.append('_'.join(current_words))
+                result.add('_'.join(current_words))
         return result
 
-    def build_index_key(self, source_id, data_name, substring):
+    def build_index_row_key(self, source_id, data_name, substring):
         return source_id + '-' + data_name + '-' + substring
 
-    def build_indexes_from_string_dto(self, dto, row_key_reference):
-        indexable_string = self. make_indexable_string(dto.data_value)
+    # idea: could add flag to run the loop again but with ommited source_id and/or dataname to
+    # return double and tripple amount of keys to make a global search available
+    def build_indexes_from_timstamped_dto(self, dto):
+        indexable_string = self.make_indexable_string(dto.data_value)
 
-        substrings = self.build_substrings(indexable_string, self.index_depth)
+        substrings = self._build_substrings(indexable_string, self.index_depth)
 
         index_dtos = []
         for substring in substrings:
-            index_key = self.build_index_key(dto.source_id, dto.data_name, substring)
-            index_dto = StringIndexDTO(index_key, dto.timestamp, row_key_reference)
+            index_row_key = self.build_index_row_key(dto.source_id, dto.data_name, substring)
+            index_dto = StringIndexDTO(index_row_key, self.__datetime_to_utc(dto.timestamp), dto.data_value)
             index_dtos.append(index_dto)
 
         return index_dtos
