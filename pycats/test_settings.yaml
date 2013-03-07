@@ -1,0 +1,3 @@
+
+# Hostname of your cassandra host used for the integration tests
+cassandra_host1 : url.to.cassandra_host

@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 from pycats.pycats import TimeSeriesCassandraDao, TimestampedDataDTO, StringIndexer, BlobIndexDTO
 import unittest
+import yaml
 
 # Tips to get started with pycats:
 #
@@ -23,7 +24,7 @@ import unittest
 #    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobDataIndex (KEY text PRIMARY KEY) WITH comparator=timestamp AND default_validation=text;
 #    cqlsh:pycats_test_space>
 #
-# 4) Enter the URLs to your cassandra instances in the list 'cassandra_hosts' in the setUp() method below
+# 4) Enter the URLs to your cassandra instances in the file test_settings.yaml. (rememeber not to commit this
 # 5) Run the tests, The tests will insert data and then load it in various scenarios.
 # 6) You can drop the key space pycats_test_space afterwards.
 #    cqlsh> DROP KEYSPACE pycats_test_space;
@@ -38,8 +39,13 @@ class PyCatsIntegrationTestBase(unittest.TestCase):
     # Ref: http://cassandra.apache.org/doc/cql/CQL.html#CREATECOLUMNFAMILY
     #
     def setUp(self):
+        f = open('test_settings.yaml')
+        settings = yaml.load(f)
+        f.close()
+        cassandra_host1 = settings['cassandra_host1']
+
         # Test constants
-        self.cassandra_hosts = ['']
+        self.cassandra_hosts = [cassandra_host1]
         self.key_space = 'pycats_test_space'
         # Use a Django cache to test the cache mechanism
         self.cache = None
@@ -63,7 +69,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
         dtos = list()
         while curr_datetime <= end_datetime:
             if self.insert_the_test_range_into_live_db:
-                dto = TimestampedDataDTO(source_id, curr_datetime, value_name, u'%s' % value)
+                dto = TimestampedDataDTO(source_id, curr_datetime, value_name, str(value))
                 if not batch_insert:
                     self.dao.insert_timestamped_data(dto)
 
@@ -78,7 +84,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
         return dtos
 
     def test_should_load_all_data_for_full_range_using_batch_insert(self):
-        source_id = 'unittest'
+        source_id = 'unittest1'
         test_metric = 'ramp_height'
         start_datetime = datetime.strptime('1979-12-31T22:00:00', '%Y-%m-%dT%H:%M:%S')
         end_datetime = datetime.strptime('1980-01-02T03:00:00', '%Y-%m-%dT%H:%M:%S')
@@ -96,7 +102,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
             self.assertEqual(result[i][1], values_inserted[i].data_value)
 
     def test_should_load_all_data_for_full_range_using_single_insert(self):
-        source_id = 'unittest'
+        source_id = 'unittest2'
         test_metric = 'ramp_height'
         start_datetime = datetime.strptime('1979-12-31T22:00:00', '%Y-%m-%dT%H:%M:%S')
         end_datetime = datetime.strptime('1980-01-02T03:00:00', '%Y-%m-%dT%H:%M:%S')
@@ -114,7 +120,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
             self.assertEqual(result[i][1], values_inserted[i].data_value)
 
     def test_should_load_correct_data_for_partial_range_using_batch_insert(self):
-        source_id = 'unittest'
+        source_id = 'unittest3'
         test_metric = 'ramp_height'
         start_datetime = datetime.strptime('1979-12-31T22:00:00', '%Y-%m-%dT%H:%M:%S')
         end_datetime = datetime.strptime('1980-01-02T03:00:00', '%Y-%m-%dT%H:%M:%S')
