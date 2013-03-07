@@ -1,6 +1,6 @@
-
+# -*- coding: utf-8 -*-
 from datetime import datetime, timedelta
-from pycats import TimeSeriesCassandraDao, TimestampedDataDTO, StringIndexer, StringIndexDTO
+from pycats.pycats import TimeSeriesCassandraDao, TimestampedDataDTO, StringIndexer, BlobIndexDTO
 import unittest
 
 # Tips to get started with pycats:
@@ -9,8 +9,8 @@ import unittest
 # 1) Use a Datastax prepared AMI on Amazon EC2 to get one or several cassandra hosts up and running
 #     Follow the guide here for example (be ware of new versions of the doc though):
 #     http://www.datastax.com/docs/1.2/install/install_ami
-# 2) Make sure you have access to the cassandra Thrift ports on the instance
-# 3) SSH to the cassandra host and execute the CQL needed to prepare the Columnfamily, ie:
+# 2) Make sure you have access to the cassandra Thrift ports on the instance (configure security groups correctly)
+# 3) SSH to the cassandra host and execute the CQL needed to prepare the Columnfamilies, ie:
 #
 #    ubuntu@ip-10-10-10-2:~$ cqlsh
 #    Connected to CassandraTest at localhost:9160.
@@ -19,6 +19,8 @@ import unittest
 #    cqlsh> CREATE KEYSPACE pycats_test_space WITH strategy_class = 'SimpleStrategy' AND strategy_options:replication_factor = '1';
 #    cqlsh> use pycats_test_space;
 #    cqlsh:pycats_test_space> CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=blob;
+#    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobData (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=blob;
+#    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobDataIndex (KEY text PRIMARY KEY) WITH comparator=timestamp AND default_validation=text;
 #    cqlsh:pycats_test_space>
 #
 # 4) Enter the URLs to your cassandra instances in the list 'cassandra_hosts' in the setUp() method below
@@ -27,7 +29,7 @@ import unittest
 #    cqlsh> DROP KEYSPACE pycats_test_space;
 #
 #
-class TimeSeriesCassandraDaoIntegrationTest(unittest.TestCase):
+class PyCatsIntegrationTestBase(unittest.TestCase):
 
     # CQL to create the MetricHourlyFloat column family
     #
@@ -45,6 +47,7 @@ class TimeSeriesCassandraDaoIntegrationTest(unittest.TestCase):
         self.dao = TimeSeriesCassandraDao(self.cassandra_hosts, self.key_space, cache=self.cache)
         self.insert_the_test_range_into_live_db = True
 
+class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
     def __insert_range_of_metrics(self, source_id, value_name, start_datetime, end_datetime, batch_insert=False):
         #
         # Insert test metrics over the days specified during setUP
@@ -129,14 +132,18 @@ class TimeSeriesCassandraDaoIntegrationTest(unittest.TestCase):
             self.assertEqual(result[i][0], values_inserted[i+1].timestamp)
             self.assertEqual(result[i][1], values_inserted[i+1].data_value)
 
-    def test_should_store_and_load_a_simple_string_and_corresponding_indexes_and_load_by_index(self):
+class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
+    def test_should_store_and_load_a_unicode_string_and_corresponding_indexes_and_load_by_index(self):
+        #arabic = u'مساعدة في تصليح كود'
         source_id = 'indexed_test_1'
         data_name = 'evil_text'
-        data_value = u'Woe to you o earth and sea. For the devil sends the beast with wrath'
+        data_value_unicode = u'Woe to you o örth ánd sea. For the devil sends the beast with wrath'
+        #data_value_utf8 = data_value_unicode.encode('utf-8')
         beastly_timestamp = datetime.strptime('1982-03-01T06:06:06', '%Y-%m-%dT%H:%M:%S')
 
-        dto = TimestampedDataDTO(source_id, beastly_timestamp, data_name, data_value)
-        self.dao.insert_timestamped_data(dto, True)
+        dto = TimestampedDataDTO(source_id, beastly_timestamp, data_name, data_value_unicode)
+        self.dao.insert_timestamped_data(dto)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto)
 
         # All values should be received for this date range
         result = self.dao.get_timetamped_data_range(source_id, data_name, beastly_timestamp- timedelta(minutes=1), beastly_timestamp+timedelta(minutes=1))
@@ -144,16 +151,15 @@ class TimeSeriesCassandraDaoIntegrationTest(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], beastly_timestamp)
-        self.assertEqual(result[0][1], data_value)
+        self.assertEqual(result[0][1], data_value_unicode)
 
         # Now make a free text search
-        search_string = 'sea. For'
-        result = self.dao.get_timestamped_data_by_search_string(source_id,data_name, search_string)
+        search_string = 'sea'
+        result = self.dao.get_blobs_by_free_text_index(source_id, data_name, search_string)
 
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], beastly_timestamp)
-        self.assertEqual(result[0][1], data_value)
-        #print result
+        self.assertEqual(result[0][1], data_value_unicode)
 
     def test_should_store_and_load_a_complex_string_and_corresponding_indexes_and_load_by_index(self):
         source_id = 'indexed_test_2'
@@ -162,23 +168,24 @@ class TimeSeriesCassandraDaoIntegrationTest(unittest.TestCase):
         beastly_timestamp = datetime.strptime('1982-03-01T06:06:06', '%Y-%m-%dT%H:%M:%S')
 
         dto = TimestampedDataDTO(source_id, beastly_timestamp, data_name, data_value)
-        self.dao.insert_timestamped_data(dto, True)
+        self.dao.insert_timestamped_data(dto)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto)
 
         # Now make a couple of free text search
         search_string = 'Notice'
-        result = self.dao.get_timestamped_data_by_search_string(source_id,data_name, search_string)
+        result = self.dao.get_blobs_by_free_text_index(source_id,data_name, search_string)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], beastly_timestamp)
         self.assertEqual(result[0][1], data_value)
 
-        search_string = 'Hans-Eklunds-MacBook-Pro'
-        result = self.dao.get_timestamped_data_by_search_string(source_id,data_name, search_string)
+        search_string = 'hans eklunds MacBook pro'
+        result = self.dao.get_blobs_by_free_text_index(source_id,data_name, search_string)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], beastly_timestamp)
         self.assertEqual(result[0][1], data_value)
 
         search_string = 'backupd-auto[3780]'
-        result = self.dao.get_timestamped_data_by_search_string(source_id,data_name, search_string)
+        result = self.dao.get_blobs_by_free_text_index(source_id,data_name, search_string)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], beastly_timestamp)
         self.assertEqual(result[0][1], data_value)
@@ -200,17 +207,21 @@ class TimeSeriesCassandraDaoIntegrationTest(unittest.TestCase):
         dto3 = TimestampedDataDTO(source_id, beastly_timestamp3, data_name, data_value3)
 
         data_value4 = u'time machine destination not recoverable.'
-        beastly_timestamp4 = datetime.strptime('1982-03-01T06:06:07', '%Y-%m-%dT%H:%M:%S')
+        beastly_timestamp4 = datetime.strptime('1982-03-01T06:06:09', '%Y-%m-%dT%H:%M:%S')
         dto4 = TimestampedDataDTO(source_id, beastly_timestamp4, data_name, data_value4)
 
-        self.dao.insert_timestamped_data(dto1, True)
-        self.dao.insert_timestamped_data(dto2, True)
-        self.dao.insert_timestamped_data(dto3, True)
-        self.dao.insert_timestamped_data(dto4, True)
+        self.dao.insert_timestamped_data(dto1)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto1)
+        self.dao.insert_timestamped_data(dto2)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto2)
+        self.dao.insert_timestamped_data(dto3)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto3)
+        self.dao.insert_timestamped_data(dto4)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto4)
 
         # Three should be found, the last one should not be found by this search
         search_string = 'Notice'
-        results = self.dao.get_timestamped_data_by_search_string(source_id,data_name, search_string)
+        results = self.dao.get_blobs_by_free_text_index(source_id, data_name, search_string)
         self.assertEqual(len(results), 3)
 
         # Assert correct order
@@ -222,8 +233,46 @@ class TimeSeriesCassandraDaoIntegrationTest(unittest.TestCase):
 
         # Assure only one hit on this unique name
         search_string = 'Hans-Smiths-MacBook'
-        results = self.dao.get_timestamped_data_by_search_string(source_id,data_name, search_string)
+        results = self.dao.get_blobs_by_free_text_index(source_id,data_name, search_string)
         self.assertEqual(len(results), 1)
+
+    def test_should_store_arabic_and_store_manual_index_and_load_by_free_text_search(self):
+        arabic_text = u'مساعدة في تصليح كود'
+        source_id = 'indexed_test_5'
+        data_name = 'evil_text'
+        data_value_unicode = arabic_text
+        #data_value_utf8 = data_value_unicode.encode('utf-8')
+        beastly_timestamp = datetime.strptime('1983-03-01T06:06:11', '%Y-%m-%dT%H:%M:%S')
+
+        dto = TimestampedDataDTO(source_id, beastly_timestamp, data_name, data_value_unicode)
+
+        # No auto-index for this baby, create a manual index
+        #self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto)
+        blob_row_key_index = self.dao.insert_blob_data(dto)
+
+        manual_indexes = list()
+
+        # Any search-strings in unicode must be converted to UTF-8 to conform with the keys in the index entries in Cassandra
+        manual_indexes.append(BlobIndexDTO(source_id, data_name, u'árabic'.encode('utf-8'), beastly_timestamp, blob_row_key_index))
+        manual_indexes.append(BlobIndexDTO(source_id, data_name, u'works'.encode('utf-8'), beastly_timestamp, blob_row_key_index))
+        self.dao.batch_insert_indexes(manual_indexes)
+
+        # All values should be received for this date range
+        result = self.dao.get_timetamped_data_range(source_id, data_name, beastly_timestamp- timedelta(minutes=1), beastly_timestamp+timedelta(minutes=1))
+        #print result
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], beastly_timestamp)
+        self.assertEqual(result[0][1], data_value_unicode)
+
+        # Now make a free text search
+        search_string = u'árabic'
+        result = self.dao.get_blobs_by_free_text_index(source_id, data_name, search_string)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], beastly_timestamp)
+        self.assertEqual(result[0][1], data_value_unicode)
 
 # The KeySpace must have a column family created as follows:
 #
@@ -235,14 +284,7 @@ class StringIndexerTest(unittest.TestCase):
     string_indxer = None
 
     def setUp(self):
-        # Test constants
-        self.cassandra_hosts = ['ec2-176-34-195-104.eu-west-1.compute.amazonaws.com']
-        self.key_space = 'pycats_test_space'
-        # Use a Django cache to test the cache mechanism
-        self.cache = None
-
         self.string_indexer = StringIndexer()
-        self.insert_the_test_range_into_live_db = True
 
     def test_should_split_simple_string_into_one_indexable_word(self):
 
@@ -250,7 +292,7 @@ class StringIndexerTest(unittest.TestCase):
         test_string = 'sea.'
 
         # When
-        result = self.string_indexer.make_indexable_string(test_string)
+        result = self.string_indexer.strip_and_lower(test_string)
 
         # Then
         expected_result = 'sea'
@@ -259,13 +301,13 @@ class StringIndexerTest(unittest.TestCase):
     def test_should_split_complex_string_into_indexable_words(self):
 
         # Given
-        test_string = self.test_strings[0]
+        test_string = u'<1921___.bg three cäts!Left__hôme(early)-In.Two.CARS'
 
         # When
-        result = self.string_indexer.make_indexable_string(test_string)
+        result = self.string_indexer.strip_and_lower(test_string)
 
         # Then
-        expected_result = '1921 bg three cats left home early in two cars'
+        expected_result = '1921 bg three c\xc3\xa4ts left h\xc3\xb4me early in two cars'
         self.assertEqual(expected_result, result)
 
 
@@ -290,7 +332,7 @@ class StringIndexerTest(unittest.TestCase):
         result = self.string_indexer._build_substrings(test_string, 2)
 
         # Then
-        expected_result = set(['hello', 'indexed', 'words', 'hello_indexed', 'indexed_words'])
+        expected_result = set(['hello', 'indexed', 'words', 'hello indexed', 'indexed words'])
         self.assertEqual(expected_result, result)
 
     def test_should_return_indexable_substrings_for_3_word_string_given_depth_5(self):
@@ -302,7 +344,7 @@ class StringIndexerTest(unittest.TestCase):
         result = self.string_indexer._build_substrings(test_string, 5)
 
         # Then
-        expected_result = set(['hello', 'indexed', 'words', 'hello_indexed', 'indexed_words', 'hello_indexed_words'])
+        expected_result = set(['hello', 'indexed', 'words', 'hello indexed', 'indexed words', 'hello indexed words'])
         self.assertEqual(expected_result, result)
 
     def test_should_return_indexable_substrings_for_5_word_string_given_depth_3(self):
@@ -314,13 +356,13 @@ class StringIndexerTest(unittest.TestCase):
         result = self.string_indexer._build_substrings(test_string, 3)
 
         # Then
-        expected_result = set(['hello', 'indexed', 'words', 'of', 'yore', 'hello_indexed', 'indexed_words', 'words_of', 'of_yore', 'hello_indexed_words', 'indexed_words_of', 'words_of_yore'])
+        expected_result = set(['hello', 'indexed', 'words', 'of', 'yore', 'hello indexed', 'indexed words', 'words of', 'of yore', 'hello indexed words', 'indexed words of', 'words of yore'])
         self.assertEqual(expected_result, result)
 
     def test_should_only_print_nr_of_words_in_result_to_show_how_many_indexes_are_needed_for_a_large_string_given_a_depth(self):
         # Given
         test_string = "Lorem Ipsum is simply dummy text of the printing and typesetting industry. Lorem Ipsum has been the industry's standard dummy text ever since the 1500s, when an unknown printer took a galley of type and scrambled it to make a type specimen book. It has survived not only five centuries, but also the leap into electronic typesetting, remaining essentially unchanged. It was popularised in the 1960s with the release of Letraset sheets containing Lorem Ipsum passages, and more recently with desktop publishing software like Aldus PageMaker including versions of Lorem Ipsum."
-        cleaned_test_string = self.string_indexer.make_indexable_string(test_string)
+        cleaned_test_string = self.string_indexer.strip_and_lower(test_string)
 
         # When
         depth = 2
@@ -333,10 +375,11 @@ class StringIndexerTest(unittest.TestCase):
 
         # Given
         test_string = 'hello indexed words of yore'
+        test_row_key = 'magic_key_123'
         dto = TimestampedDataDTO('the_kids', datetime.utcnow(), 'log_text', test_string)
 
         # When
-        result = self.string_indexer.build_indexes_from_timstamped_dto(dto)
+        result = self.string_indexer.build_indexes_from_timstamped_dto(dto, test_row_key)
 
         # Then
         for index_dto in result:

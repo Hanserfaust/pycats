@@ -1,10 +1,12 @@
+# -*- coding: utf-8 -*-
 import pycassa
-import time
 import pytz
+import time
 from datetime import datetime, timedelta
 from logging import debug, error, info
 import re
 import string
+from models import TimestampedDataDTO, BlobIndexDTO
 
 #
 # Create the DAO using a List of cassandra hosts and a KeySpace
@@ -20,27 +22,18 @@ import string
 MAX_COLUMNS = 60*60*24
 CACHE_TTL = 8*60*60 # 8 hours
 # Sorry we are not Y10K compatible, just need something surely beyond anything reasonable
-MAX_TIME = datetime.strptime('2100-01-01T01:59:59', '%Y-%m-%dT%H:%M:%S')
-
-class TimestampedDataDTO():
-    def __init__(self, source_id, timestamp, data_name, data_value):
-        self.source_id = source_id
-        self.timestamp = timestamp
-        self.data_name = data_name
-        self.data_value = data_value
-
-class StringIndexDTO():
-    def __init__(self, row_key, timestamp, data_value):
-        self.row_key = row_key
-        self.timestamp = timestamp
-        self.data_value = data_value
-
-    def __unicode__(self):
-        return u'%s for %s on time %s' % (self.row_key, self.data_value, self.timestamp)
+MAX_TIME = datetime.strptime('2900-01-01T01:59:59', '%Y-%m-%dT%H:%M:%S')
 
 class TimeSeriesCassandraDao():
+    #  CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=blob;
     HOURLY_DATA_COLUMN_FAMILY_NAME = 'HourlyTimestampedData'
-    STRING_INDEX_COLUMN_FAMILY_NAME = 'StringIndex'
+
+    # CREATE COLUMNFAMILY BlobData (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=blob;
+    BLOB_DATA_COLUMN_FAMILY_NAME = 'BlobData'
+
+    # CREATE COLUMNFAMILY BlobDataIndex (KEY text PRIMARY KEY) WITH comparator=timestamp AND default_validation=text;
+    BLOB_DATA_INDEX_COLUMN_FAMILY_NAME = 'BlobDataIndex'
+
     string_indexer = None
 
     def __init__(self, cassandra_hosts, key_space, cache=None, warm_up_cache_shards=0):
@@ -54,21 +47,23 @@ class TimeSeriesCassandraDao():
         self.string_indexer = StringIndexer()
 
     def __get_hourly_data_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME)
+        return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME, )
 
-    def __get_indexed_data_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME)
+    def __get_blob_data_cf(self):
+        return pycassa.ColumnFamily(self.__pool, self.BLOB_DATA_COLUMN_FAMILY_NAME)
 
-    def __get_string_index_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.STRING_INDEX_COLUMN_FAMILY_NAME)
-
-    def __build_row_key_for_hourly(self, source_id, data_name, utc_datetime):
-        time_part = utc_datetime.strftime('%Y%m%d%H')
-        return str(source_id+'-'+data_name+'-'+time_part)
+    def __get_blob_data_index_cf(self):
+        return pycassa.ColumnFamily(self.__pool, self.BLOB_DATA_INDEX_COLUMN_FAMILY_NAME)
 
     # Convert datetime object to millisecond precision unix epoch
     def __unix_time_millis(self, dt):
         return long(time.mktime(dt.timetuple())*1e3 + dt.microsecond/1e3)
+
+    def __datetime_to_utc(self, a_datetime):
+        if a_datetime.tzinfo:
+            return a_datetime.astimezone (pytz.utc)
+        else:
+            return a_datetime
 
     def __from_unix_time_millis(self, unix_time_millis):
         seconds = unix_time_millis / 1000
@@ -76,14 +71,6 @@ class TimeSeriesCassandraDao():
         the_datetime = datetime.utcfromtimestamp(seconds)
         the_datetime + timedelta(milliseconds=millis)
         return the_datetime
-
-    def __datetime_to_utc(self, a_datetime):
-        if a_datetime.tzinfo:
-            # Convert to UTC if timezone info
-            return a_datetime.astimezone (pytz.utc)
-        else:
-            # Assume datetime was in UTC if no timezone info exists
-            return a_datetime
 
     # TODO: bleeeeh.. how ugly, can some just optimize this???
     def __datetime_is_in_now_hour(self, a_datetime):
@@ -136,75 +123,80 @@ class TimeSeriesCassandraDao():
             microseconds=tm.microsecond)
         return tm
 
-    def __build_pycassa_insert_list(self, dto):
-        utc_datetime = self.__datetime_to_utc(dto.timestamp)
-        row_key = self.__build_row_key_for_hourly(dto.source_id, dto.data_name, utc_datetime)
-
-        column_name = utc_datetime
-
-        # Note: if you dont want to store it as unicode string, cast it to float
-        # for example, and make sure to create the column family with 'float' as default validator
-        # see http://cassandra.apache.org/doc/cql/CQL.html#CREATECOLUMNFAMILY and
-        # http://cassandra.apache.org/doc/cql/CQL.html#storageTypes
-        # You need a float/int validator to use conditional queries (ie greater than.. )
-        column_value = u'%s' % dto.data_value
-
-        return [row_key, column_name, column_value]
-
-    def __build_pycassa_insert_tuple(self, dto):
-        i_list = self.__build_pycassa_insert_list(dto)
-        return (i_list[0], {i_list[1] : i_list[2]})
-
     ##
-    ## Data storage interface
+    ## Data insertion
     ##
     ######################################################
-
-    def insert_timestamped_data(self, timestamped_data_dto, create_indexes=False):
-        i_list = self.__build_pycassa_insert_list(timestamped_data_dto)
-
-        # Insert in hour bucket
-        result = self.__get_hourly_data_cf().insert(i_list[0], {i_list[1] : i_list[2]})
-
-        if create_indexes:
-            row_key = i_list[0]         # the key to reference
-
-            # Will return list of StringIndexDTO
-            list_of_string_index_dtos = self.string_indexer.build_indexes_from_timstamped_dto(timestamped_data_dto)
-
-            # Convert them to list of insertable tuples for batch insertion
-            insert_tuples = dict()
-            for dto in list_of_string_index_dtos:
-                row_key = dto.row_key
-                col_name_value_pair = {dto.timestamp : timestamped_data_dto.data_value}    # Note, all index dtos has same timestamp (which is the "column_name" for the timestamped data above)
-                insert_tuples[row_key] = col_name_value_pair
-
-            # And perform the insertion
-            self.__get_string_index_cf().batch_insert(insert_tuples)
-
+    def insert_timestamped_data(self, ts_data_dto):
+        # UTF-8 encode?
+        result = self.__get_hourly_data_cf().insert(ts_data_dto.get_row_key_for_hourly(), {ts_data_dto.timestamp_as_utc() : ts_data_dto.data_value})
         return result
 
+    # Will only insert into the buckets
     def batch_insert_timestamped_data(self, list_of_timestamped_data_dtos):
         insert_tuples = dict()
 
         for dto in list_of_timestamped_data_dtos:
-            tuple = self.__build_pycassa_insert_tuple(dto)
-            row_key = tuple[0]
-            col_name_value_pairs = insert_tuples.get(row_key, None)
+            horuly_bucket_row_key = dto.get_row_key_for_hourly()
+            col_name_value_pairs = insert_tuples.get(horuly_bucket_row_key, None)
             if not col_name_value_pairs:
                 col_name_value_pairs = dict()
-            col_name_value_pairs.update(tuple[1])
-            insert_tuples[row_key] = col_name_value_pairs
+            col_name_value_pairs[dto.timestamp_as_utc()] = dto.data_value
+            insert_tuples[horuly_bucket_row_key] = col_name_value_pairs
 
         self.__get_hourly_data_cf().batch_insert(insert_tuples)
 
-    def get_timestamped_data_by_search_string(self, source_id, data_name, search_string):
-        substring = '_'.join(self.string_indexer.make_indexable_string(search_string).split())
-        return self.get_timestamped_data_by_index(source_id, data_name, substring)
+    # Convenience method to insert a blob that can be auto-indexed, data is typically text
+    # If not suitable, just store the blob, and insert indexes manually (create your own suitable indexes, such as tags)
+    def insert_indexable_text_as_blob_data_and_insert_index(self, ts_data_dto):
+        blob_data_row_key = self.insert_blob_data(ts_data_dto)
+        list_of_string_index_dtos = self.string_indexer.build_indexes_from_timstamped_dto(ts_data_dto, blob_data_row_key)
+        self.batch_insert_indexes(list_of_string_index_dtos)
 
-    def get_timestamped_data_by_index(self, source_id, data_name, substring):
-        index_row_key = self.string_indexer.build_index_row_key(source_id, data_name, substring)
-        return self.__get_string_index_cf().get(index_row_key, column_reversed=False, column_count=MAX_COLUMNS).items()
+    def insert_blob_data(self, blob_data_dto):
+        row_key = blob_data_dto.get_row_key_for_blob_data()
+        self.__get_blob_data_cf().insert(row_key, {blob_data_dto.timestamp_as_utc() : blob_data_dto.data_value})
+        return row_key
+
+    def batch_insert_indexes(self, index_dtos):
+        insert_tuples = dict()
+
+        for dto in index_dtos:
+            insert_tuples[dto.get_row_key()] = {dto.timestamp_as_utc() : dto.blob_data_row_key}
+
+        # And perform the insertion
+        self.__get_blob_data_index_cf().batch_insert(insert_tuples)
+
+    ##
+    ## Data loading
+    ##
+    ######################################################
+    def get_blobs_by_free_text_index(self, source_id, data_name, free_text, to_list_of_tuples=True):
+        scrubbed_free_text = self.string_indexer.strip_and_lower(free_text)
+        # Just create empty index-dto for key generation
+        index_row_key = BlobIndexDTO(source_id, data_name, scrubbed_free_text, None, None).get_row_key()
+        try:
+            result_from_index = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=MAX_COLUMNS).items()
+        except Exception as e:
+            # Not found mostlikley
+            return None
+
+        ts_data_row_keys_to_multi_fetch = list()
+        for string_index_result in result_from_index:
+            #utc_timestamp = string_index_result[0]
+            ts_data_row_key = string_index_result[1]
+            ts_data_row_keys_to_multi_fetch.append(ts_data_row_key)
+
+        # Drop the key from the result by calling .values()
+        list_of_ordered_dicts = self.__get_blob_data_cf().multiget(ts_data_row_keys_to_multi_fetch).values()
+        if to_list_of_tuples:
+            list_of_tuples = list()
+            for ordered_dict in list_of_ordered_dicts:
+                item = ordered_dict.items()[0]
+                list_of_tuples.append((item[0], item[1]))
+            return list_of_tuples
+        else:
+            return list_of_ordered_dicts
 
     # Load data for given metric_name, a start and end datetime and source_id
     def get_timetamped_data_range(self, source_id, metric_name, start_datetime, end_datetime):
@@ -227,7 +219,8 @@ class TimeSeriesCassandraDao():
         result = list()
 
         for a_datetime in datetimes:
-            row_key = self.__build_row_key_for_hourly(source_id, metric_name, a_datetime)
+            # Build dto without value for key generation
+            row_key = TimestampedDataDTO( source_id, a_datetime, metric_name, None).get_row_key_for_hourly()
             try:
                 debug('trying %s' % (row_key))
                 a_shard = self.__get_hourly_data_cached(row_key, a_datetime)
@@ -276,47 +269,6 @@ class TimeSeriesCassandraDao():
 
         return result
 
-
-# A simple example of an indexer for the bucketed storage above, useful if
-# you are storing strings in the buckets and want to make them searchable
-#
-# Idea: The TimeSeriesCassandraDao class stores any kind of data
-# based on a row key that is assembled. Any row represent data during
-# a specific hour, as explained above.
-#
-# The indexer class can then create aditional keys in another column family
-# named 'StringIndex', representing references to the data stored in the buckets:
-#
-# Say we want to store this data, as a TimestampedDataDTO()
-#  timestamp = 2012-12-24T18:12:33
-#  source_id = 'the_kids'
-#  data_name = 'log_info'
-#  data_value = 'Santa is comming'
-#
-# The method __build_row_key_for_hourly() would return a row key for an hourly bucket
-#  data_row_key = 2012122418-the_kids-data_name
-# The column name is the timestamp and the value is of course the data_value
-#
-# Now, a typical scenario is to search for 'santa' or 'comming' given
-# we want to search for stuff said by 'the_kids' with 'log_info' kind
-# of messages. We kan then store a new column in the 'StringIndex'
-# column family using the follwing row_key
-#
-# row_key = 'the_kids.log_info.santa' and add another column and value would be
-# column_name = 2012-12-24T18:12:33
-# column_value = 2012122418-the_kids-data_name
-#
-# So, a query for santa would yield all columns on row
-#
-# Using the column_value(s), we would query the Hourly buckets and ask for
-# the data on the corresponding 'column_name' (which is the timestamp).
-#
-# A caveat: to be able to sarch not only for santa we would also insert
-# indexes for 'santa', 'is', 'comming', 'santa is', 'is comming' and 'santa is comming'.
-# The work of creating that array of indexable substrings is taken care of
-# by the class below
-#
-#
 class StringIndexer():
     white_list = string.letters + string.digits + ' '
     index_depth = 5
@@ -324,10 +276,16 @@ class StringIndexer():
 
     # Takes a string and returns a clean string of lower-case words only
     # Makes a good base to create index from
-    def make_indexable_string(self, string):
-        pattern = re.compile('([^\s\w]|_)+')
-        strippedList = pattern.sub(' ', string)
-        return strippedList.lower().strip(' \t\n\r')
+    def strip_and_lower(self, string):
+        # Split only on a couple of separators an do lower
+        r1 = re.sub('[,\.\-=!@#$\(\)<>_\[\]\'\"\´\:]', ' ', string.lower())
+        r2 = ' '.join(r1.split())
+        return r2.encode('utf-8')
+
+        #pattern = re.compile('([^\s\w]|_)+')
+        #strippedList = pattern.sub(' ', string)
+        #return strippedList.lower().strip(' \t\n\r')
+
 
     # Will split a sting and return the permutations given depth
     # made for storing short scentences too use as index
@@ -346,23 +304,19 @@ class StringIndexer():
                 if i+d+1 > len(words):
                     continue
                 current_words = words[i:i+d+1]
-                result.add('_'.join(current_words))
+                result.add(' '.join(current_words))
         return result
-
-    def build_index_row_key(self, source_id, data_name, substring):
-        return source_id + '-' + data_name + '-' + substring
 
     # idea: could add flag to run the loop again but with ommited source_id and/or dataname to
     # return double and tripple amount of keys to make a global search available
-    def build_indexes_from_timstamped_dto(self, dto):
-        indexable_string = self.make_indexable_string(dto.data_value)
+    def build_indexes_from_timstamped_dto(self, dto, blob_data_row_key):
+        indexable_string = self.strip_and_lower(dto.data_value)
 
         substrings = self._build_substrings(indexable_string, self.index_depth)
 
         index_dtos = []
         for substring in substrings:
-            index_row_key = self.build_index_row_key(dto.source_id, dto.data_name, substring)
-            index_dto = StringIndexDTO(index_row_key, self.__datetime_to_utc(dto.timestamp), dto.data_value)
+            index_dto = BlobIndexDTO(dto.source_id, dto.data_name, substring, dto.timestamp, blob_data_row_key)
             index_dtos.append(index_dto)
 
         return index_dtos
