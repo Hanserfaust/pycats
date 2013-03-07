@@ -39,7 +39,7 @@ class PyCatsIntegrationTestBase(unittest.TestCase):
     #
     def setUp(self):
         # Test constants
-        self.cassandra_hosts = ['ec2-176-34-195-104.eu-west-1.compute.amazonaws.com']
+        self.cassandra_hosts = ['']
         self.key_space = 'pycats_test_space'
         # Use a Django cache to test the cache mechanism
         self.cache = None
