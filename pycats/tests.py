@@ -6,6 +6,8 @@ import yaml
 
 # Tips to get started with pycats:
 #
+# 0) Create test_settings.yaml, it has one line like this: "cassandra_host1 : ec2-somenumbers123.compute.amazonaws.com" without quotes
+#    in the same directory as tests.py (this file).
 #
 # 1) Use a Datastax prepared AMI on Amazon EC2 to get one or several cassandra hosts up and running
 #     Follow the guide here for example (be ware of new versions of the doc though):
@@ -319,11 +321,48 @@ class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
         self.assertEqual(result[2][0], beastly_timestamp3)
         self.assertEqual(result[2][1], data_value_unicode3)
 
-# The KeySpace must have a column family created as follows:
-#
-# CREATE COLUMNFAMILY IndexedStrings (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=text;
-#
-####################################################################################
+    def test_should_store_data_for_several_data_names_and_load_by_index_with_date_range(self):
+        source_id = 'indexed_test_7'
+        data_name1 = 'evil3_text'
+        data_name2 = 'bad3_text'
+        data_name3 = 'nasty3_text'
+
+        # Note, they differ slightly, but has common words so search can hit all of them
+        data_value_unicode1 = u'Woe to you o örth ánd sea. For the devil sends the beast with wrath'
+        data_value_unicode2 = u'Darn to you o örth ánd sea. For the mother sends the beast with wrath'
+        data_value_unicode3 = u'Hey to you o örth ánd sea. For the bushes sends the beast with wrath'
+        #data_value_utf8 = data_value_unicode.encode('utf-8')
+        beastly_timestamp1 = datetime.strptime('1982-03-01T06:06:05', '%Y-%m-%dT%H:%M:%S')
+        beastly_timestamp2 = datetime.strptime('1982-03-01T06:07:05', '%Y-%m-%dT%H:%M:%S')
+        beastly_timestamp3 = datetime.strptime('1982-03-01T06:08:05', '%Y-%m-%dT%H:%M:%S')
+
+        dto1 = TimestampedDataDTO(source_id, beastly_timestamp1, data_name1, data_value_unicode1)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto1)
+        dto2 = TimestampedDataDTO(source_id, beastly_timestamp2, data_name2, data_value_unicode2)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto2)
+        dto3 = TimestampedDataDTO(source_id, beastly_timestamp3, data_name3, data_value_unicode3)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto3)
+
+        # Now make a free text search
+        search_string = 'sea'
+        start_time = datetime.strptime('1982-03-01T06:07:00', '%Y-%m-%dT%H:%M:%S')
+        end_time = datetime.strptime('1982-03-01T06:07:10', '%Y-%m-%dT%H:%M:%S')
+        result = self.dao.get_blobs_multi_data_by_free_text_index(source_id, [data_name1, data_name2, data_name3], search_string, start_time, end_time)
+
+        # Should only find middle instance for given range
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], beastly_timestamp2)
+        self.assertEqual(result[0][1], data_value_unicode2)
+
+        # Now make same free text search with something that should NOT hit
+        search_string = 'volvo'
+        start_time = datetime.strptime('1982-03-01T06:07:00', '%Y-%m-%dT%H:%M:%S')
+        end_time = datetime.strptime('1982-03-01T06:07:10', '%Y-%m-%dT%H:%M:%S')
+        result = self.dao.get_blobs_multi_data_by_free_text_index(source_id, [data_name1, data_name2, data_name3], search_string, start_time, end_time)
+
+        # Should only find middle instance for given range
+        self.assertEqual(len(result), 0)
+
 class StringIndexerTest(unittest.TestCase):
     test_strings = ['<1921___.bg three cats!Left__home(early)-In.Two.CARS', 'One man left Home early!!', 'two Woman left homE Late?', 'one Car_turned Left at Our HOME']
     string_indxer = None
