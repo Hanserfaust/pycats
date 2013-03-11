@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import pycassa
+from pycassa.cassandra.ttypes import NotFoundException
 import pytz
 import time
 from datetime import datetime, timedelta
@@ -25,16 +26,17 @@ CACHE_TTL = 8*60*60 # 8 hours
 MAX_TIME = datetime.strptime('2900-01-01T01:59:59', '%Y-%m-%dT%H:%M:%S')
 
 class TimeSeriesCassandraDao():
-    #  CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=blob;
+    #  CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=timestamp;
     HOURLY_DATA_COLUMN_FAMILY_NAME = 'HourlyTimestampedData'
 
-    # CREATE COLUMNFAMILY BlobData (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=blob;
+    # CREATE COLUMNFAMILY BlobData (KEY ascii PRIMARY KEY) WITH comparator=timestamp;
     BLOB_DATA_COLUMN_FAMILY_NAME = 'BlobData'
 
     # CREATE COLUMNFAMILY BlobDataIndex (KEY text PRIMARY KEY) WITH comparator=timestamp AND default_validation=text;
     BLOB_DATA_INDEX_COLUMN_FAMILY_NAME = 'BlobDataIndex'
 
-    string_indexer = None
+    # Maybe the dao should be un-aware of the indexer, break out and make it cleaner?
+    blob_indexer = None
 
     def __init__(self, cassandra_hosts, key_space, cache=None, warm_up_cache_shards=0):
         self.__cassandra_hosts = cassandra_hosts
@@ -44,7 +46,7 @@ class TimeSeriesCassandraDao():
         self.cache_hits = 0
         self.daily_gets = 0
         self.__warm_up_cache_shards = warm_up_cache_shards
-        self.string_indexer = StringIndexer()
+        self.blob_indexer = StringIndexer()
 
     def __get_hourly_data_cf(self):
         return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME, )
@@ -147,11 +149,17 @@ class TimeSeriesCassandraDao():
         self.__get_hourly_data_cf().batch_insert(insert_tuples)
 
     # Convenience method to insert a blob that can be auto-indexed, data is typically text
-    # If not suitable, just store the blob, and insert indexes manually (create your own suitable indexes, such as tags)
+    # If not suitable, just store the blob, and insert indexes manually (create your own suitable indexes, ie based on tags)
     def insert_indexable_text_as_blob_data_and_insert_index(self, ts_data_dto):
+        # 1 Insert as Blob
         blob_data_row_key = self.insert_blob_data(ts_data_dto)
-        list_of_string_index_dtos = self.string_indexer.build_indexes_from_timstamped_dto(ts_data_dto, blob_data_row_key)
-        self.batch_insert_indexes(list_of_string_index_dtos)
+        list_of_blob_index_dtos = self.blob_indexer.build_indexes_from_timstamped_dto(ts_data_dto, blob_data_row_key)
+
+        # 2 Insert indexes for Blob
+        self.batch_insert_indexes(list_of_blob_index_dtos)
+
+        # 3 Store in timeseries bucket
+        self.insert_timestamped_data(ts_data_dto)
 
     def insert_blob_data(self, blob_data_dto):
         row_key = blob_data_dto.get_row_key_for_blob_data()
@@ -171,24 +179,45 @@ class TimeSeriesCassandraDao():
     ## Data loading
     ##
     ######################################################
-    def get_blobs_by_free_text_index(self, source_id, data_name, free_text, to_list_of_tuples=True):
-        scrubbed_free_text = self.string_indexer.strip_and_lower(free_text)
-        # Just create empty index-dto for key generation
+
+    # Given a list of data_names search for same string in them
+    def get_blobs_multi_data_by_free_text_index(self, source_id, data_names, free_text, start_date="", end_date="", to_list_of_tuples=True):
+        blob_index_rows = list()
+
+        for data_name in data_names:
+            blob_index_rows.append(self.get_blob_index_row(source_id, data_name, free_text, start_date, end_date))
+
+        return self.get_blobs_by_kyes(blob_index_rows, to_list_of_tuples)
+
+    def get_blob_index_row(self, source_id, data_name, free_text, start_date="", end_date=""):
+        scrubbed_free_text = self.blob_indexer.strip_and_lower(free_text)
+        # We dont need the DTO, Just create one for key generation
         index_row_key = BlobIndexDTO(source_id, data_name, scrubbed_free_text, None, None).get_row_key()
         try:
-            result_from_index = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=MAX_COLUMNS).items()
-        except Exception as e:
-            # Not found mostlikley
-            return None
+            # Note, a row contains many keys
+            blob_index_row = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=MAX_COLUMNS, column_start=start_date, column_finish=end_date).items()
+        except NotFoundException as e:
+            # Differ between not found in Index and not found in Blob-CF (the load done in get_blobs_by_kyes()) which would be a serious error.
+            return []
 
-        ts_data_row_keys_to_multi_fetch = list()
-        for string_index_result in result_from_index:
-            #utc_timestamp = string_index_result[0]
-            ts_data_row_key = string_index_result[1]
-            ts_data_row_keys_to_multi_fetch.append(ts_data_row_key)
+        return blob_index_row
+
+    def get_blobs_by_free_text_index(self, source_id, data_name, free_text, start_date="", end_date="", to_list_of_tuples=True):
+        blob_index_row = self.get_blob_index_row(source_id, data_name, free_text, start_date, end_date)
+        return self.get_blobs_by_kyes([blob_index_row], to_list_of_tuples)
+
+    def get_blobs_by_kyes(self, blob_index_rows, to_list_of_tuples=True):
+        ts_data_row_keys_to_multi_fetch = set()
+
+        for blob_index_row in blob_index_rows:
+            for blob_index in blob_index_row:
+                #utc_timestamp = blob_index_result[0]
+                ts_data_row_key = blob_index[1]
+                ts_data_row_keys_to_multi_fetch.add(ts_data_row_key)
 
         # Drop the key from the result by calling .values()
-        list_of_ordered_dicts = self.__get_blob_data_cf().multiget(ts_data_row_keys_to_multi_fetch).values()
+        list_of_ordered_dicts = self.__get_blob_data_cf().multiget(list(ts_data_row_keys_to_multi_fetch)).values()
+
         if to_list_of_tuples:
             list_of_tuples = list()
             for ordered_dict in list_of_ordered_dicts:
@@ -269,6 +298,8 @@ class TimeSeriesCassandraDao():
 
         return result
 
+# Can index a blob that is a valid utf-8 string. If blob is not a valid utf-8 (ie. a png-imgage, skip
+# this and create a few tags manually)
 class StringIndexer():
     white_list = string.letters + string.digits + ' '
     index_depth = 5

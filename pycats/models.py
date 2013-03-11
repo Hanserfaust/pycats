@@ -8,6 +8,10 @@ class TimestampedDataDTO():
         self.data_name = data_name
         self.data_value = data_value
 
+    @staticmethod
+    def generate_source_id(namespace, uid):
+        return namespace + '.' + uid
+
     def get_pycassa_hourly_insert_tuple(self, dto):
         row_key = self.get_row_key_for_hourly()
         col_name = self.timestamp_as_utc()
@@ -37,6 +41,9 @@ class TimestampedDataDTO():
 
     def timestamp_as_unix_time_millis(self, dt):
         return long(time.mktime(dt.timetuple())*1e3 + dt.microsecond/1e3)
+
+    def __unicode__(self):
+        return u'%s from %s : %s=%s' % (self.timestamp, self.source_id, self.data_name, self.data_value)
 
 class BlobIndexDTO():
     def __init__(self, source_id, data_name, free_text, timestamp, blob_data_row_key):

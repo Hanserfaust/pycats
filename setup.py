@@ -3,7 +3,7 @@
 from distutils.core import setup
 
 setup(name='Pycats',
-    version='0.2',
+    version='0.26',
     description='Time series storage for cassandra, built on Pycassa',
     author='Hans Eklund',
     author_email='hans.eklund@igw.se',

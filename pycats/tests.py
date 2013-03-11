@@ -19,8 +19,8 @@ import yaml
 #    Use HELP for help.
 #    cqlsh> CREATE KEYSPACE pycats_test_space WITH strategy_class = 'SimpleStrategy' AND strategy_options:replication_factor = '1';
 #    cqlsh> use pycats_test_space;
-#    cqlsh:pycats_test_space> CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=blob;
-#    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobData (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=blob;
+#    cqlsh:pycats_test_space> CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=timestamp;
+#    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobData (KEY ascii PRIMARY KEY) WITH comparator=timestamp;
 #    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobDataIndex (KEY text PRIMARY KEY) WITH comparator=timestamp AND default_validation=text;
 #    cqlsh:pycats_test_space>
 #
@@ -39,6 +39,7 @@ class PyCatsIntegrationTestBase(unittest.TestCase):
     # Ref: http://cassandra.apache.org/doc/cql/CQL.html#CREATECOLUMNFAMILY
     #
     def setUp(self):
+        # test_settings.yaml has one line like this: "cassandra_host1 : ec2-somenumbers123.compute.amazonaws.com" without quotes
         f = open('test_settings.yaml')
         settings = yaml.load(f)
         f.close()
@@ -139,8 +140,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
             self.assertEqual(result[i][1], values_inserted[i+1].data_value)
 
 class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
-    def test_should_store_and_load_a_unicode_string_and_corresponding_indexes_and_load_by_index(self):
-        #arabic = u'مساعدة في تصليح كود'
+    def test_should_store_a_unicode_string_and_corresponding_indexes_and_load_by_date_range_and_index(self):
         source_id = 'indexed_test_1'
         data_name = 'evil_text'
         data_value_unicode = u'Woe to you o örth ánd sea. For the devil sends the beast with wrath'
@@ -196,11 +196,16 @@ class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
         self.assertEqual(result[0][0], beastly_timestamp)
         self.assertEqual(result[0][1], data_value)
 
+        # Test what happens on no hits
+        search_string = 'w000000000t'
+        result = self.dao.get_blobs_by_free_text_index(source_id,data_name, search_string)
+        self.assertEqual(len(result), 0)
+
     def test_should_store_muliple_similar_complex_strings_with_different_timestamps_saved_out_of_order_should_be_loaded_in_order(self):
         source_id = 'indexed_test_3'
         data_name = 'evil_text'
 
-        data_value1 = u'Hans-Eklunds-MacBook-Pro com.apple.backupd-auto[3780] <Notice>: Not starting scheduled Time Machine backup - time machine destination not resolvable.'
+        data_value1 = u'Hans-Eklunds-MacBook-Pro com.apple.backupd-auto[3780] <Notice>: Not stârting scheduled Time Machine backup - time machine destination not resolvable.'
         beastly_timestamp1 = datetime.strptime('1982-03-01T06:06:06', '%Y-%m-%dT%H:%M:%S')
         dto1 = TimestampedDataDTO(source_id, beastly_timestamp1, data_name, data_value1)
 
@@ -279,6 +284,40 @@ class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], beastly_timestamp)
         self.assertEqual(result[0][1], data_value_unicode)
+
+    def test_should_store_data_for_several_data_names_and_load_by_multi_data_index_search(self):
+        source_id = 'indexed_test_6'
+        data_name1 = 'evil3_text'
+        data_name2 = 'bad3_text'
+        data_name3 = 'nasty3_text'
+
+        # Note, they differ slightly, but has common words so search can hit all of them
+        data_value_unicode1 = u'Woe to you o örth ánd sea. For the devil sends the beast with wrath'
+        data_value_unicode2 = u'Darn to you o örth ánd sea. For the mother sends the beast with wrath'
+        data_value_unicode3 = u'Hey to you o örth ánd sea. For the bushes sends the beast with wrath'
+        #data_value_utf8 = data_value_unicode.encode('utf-8')
+        beastly_timestamp1 = datetime.strptime('1982-03-01T06:06:06', '%Y-%m-%dT%H:%M:%S')
+        beastly_timestamp2 = datetime.strptime('1982-03-01T06:06:07', '%Y-%m-%dT%H:%M:%S')
+        beastly_timestamp3 = datetime.strptime('1982-03-01T06:06:08', '%Y-%m-%dT%H:%M:%S')
+
+        dto1 = TimestampedDataDTO(source_id, beastly_timestamp1, data_name1, data_value_unicode1)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto1)
+        dto2 = TimestampedDataDTO(source_id, beastly_timestamp2, data_name2, data_value_unicode2)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto2)
+        dto3 = TimestampedDataDTO(source_id, beastly_timestamp3, data_name3, data_value_unicode3)
+        self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto3)
+
+        # Now make a free text search
+        search_string = 'sea'
+        result = self.dao.get_blobs_multi_data_by_free_text_index(source_id, [data_name1, data_name2, data_name3], search_string)
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0][0], beastly_timestamp1)
+        self.assertEqual(result[0][1], data_value_unicode1)
+        self.assertEqual(result[1][0], beastly_timestamp2)
+        self.assertEqual(result[1][1], data_value_unicode2)
+        self.assertEqual(result[2][0], beastly_timestamp3)
+        self.assertEqual(result[2][1], data_value_unicode3)
 
 # The KeySpace must have a column family created as follows:
 #
