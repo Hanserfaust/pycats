@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime, timedelta
 from pycats.pycats import TimeSeriesCassandraDao, TimestampedDataDTO, StringIndexer, BlobIndexDTO
+from facades import CassandraLogger
 import unittest
 import yaml
 
@@ -21,7 +22,7 @@ import yaml
 #    Use HELP for help.
 #    cqlsh> CREATE KEYSPACE pycats_test_space WITH strategy_class = 'SimpleStrategy' AND strategy_options:replication_factor = '1';
 #    cqlsh> use pycats_test_space;
-#    cqlsh:pycats_test_space> CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=timestamp;
+#    cqlsh:pycats_test_space> CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=bigint;
 #    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobData (KEY ascii PRIMARY KEY) WITH comparator=timestamp;
 #    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobDataIndex (KEY text PRIMARY KEY) WITH comparator=timestamp AND default_validation=text;
 #    cqlsh:pycats_test_space>
@@ -53,10 +54,12 @@ class PyCatsIntegrationTestBase(unittest.TestCase):
         # Use a Django cache to test the cache mechanism
         self.cache = None
 
-        self.dao = TimeSeriesCassandraDao(self.cassandra_hosts, self.key_space, cache=self.cache)
+        # Run tests with disable_high_res_column_name_randomization=True and false, erase HourlyTimestampedData in between
+        self.dao = TimeSeriesCassandraDao(self.cassandra_hosts, self.key_space, cache=self.cache, disable_high_res_column_name_randomization=True)
         self.insert_the_test_range_into_live_db = True
 
 class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
+
     def __insert_range_of_metrics(self, source_id, value_name, start_datetime, end_datetime, batch_insert=False):
         #
         # Insert test metrics over the days specified during setUP
@@ -77,7 +80,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
                     self.dao.insert_timestamped_data(dto)
 
                 dtos.append(dto)
-            curr_datetime = curr_datetime + timedelta(minutes=10)
+            curr_datetime = curr_datetime + timedelta(minutes=20)
             values_inserted += 1
             value += 1
 
@@ -86,11 +89,32 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
             self.dao.batch_insert_timestamped_data(dtos)
         return dtos
 
+    def test_should_pass_a_datetime_through_high_res_column_generator_and_back(self):
+        a_datetime = datetime.strptime('1979-06-20T06:06:07.213462', '%Y-%m-%dT%H:%M:%S.%f')
+        start_of_hour = datetime.strptime('1979-06-20T06:00:00.0000', '%Y-%m-%dT%H:%M:%S.%f')
+
+        self.assertNotEqual(a_datetime, start_of_hour)
+
+        high_res_column_name = self.dao.get_high_res_column_name(a_datetime)
+
+        resulting_datetime = self.dao.highres_to_utc_datetime(start_of_hour, high_res_column_name)
+
+        self.assertEqual(a_datetime, resulting_datetime)
+
+    def test_should_floor_timestamp_to_hour_correctly(self):
+
+        a_datetime                  = datetime.strptime('1979-06-20T06:06:07.213462', '%Y-%m-%dT%H:%M:%S.%f')
+        expected_floored_datetime   = datetime.strptime('1979-06-20T06:00:00.0000', '%Y-%m-%dT%H:%M:%S.%f')
+
+        resulting_datetime = self.dao.floor_timestamp_to_hour(a_datetime)
+
+        self.assertEqual(expected_floored_datetime, resulting_datetime)
+
     def test_should_load_all_data_for_full_range_using_batch_insert(self):
         source_id = 'unittest1'
         test_metric = 'ramp_height'
         start_datetime = datetime.strptime('1979-12-31T22:00:00', '%Y-%m-%dT%H:%M:%S')
-        end_datetime = datetime.strptime('1980-01-02T03:00:00', '%Y-%m-%dT%H:%M:%S')
+        end_datetime = datetime.strptime('1980-01-01T03:00:00', '%Y-%m-%dT%H:%M:%S')
 
         values_inserted = self.__insert_range_of_metrics(source_id, test_metric, start_datetime, end_datetime, batch_insert=True)
 
@@ -104,9 +128,10 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
             self.assertEqual(result[i][0], values_inserted[i].timestamp)
             self.assertEqual(result[i][1], values_inserted[i].data_value)
 
+    # NOTE: dash (-) in source_id and test_metric to test that it does not disturb pycats row-key model
     def test_should_load_all_data_for_full_range_using_single_insert(self):
-        source_id = 'unittest2'
-        test_metric = 'ramp_height'
+        source_id = 'unittest2-'
+        test_metric = 'ramp-height'
         start_datetime = datetime.strptime('1979-12-31T22:00:00', '%Y-%m-%dT%H:%M:%S')
         end_datetime = datetime.strptime('1980-01-02T03:00:00', '%Y-%m-%dT%H:%M:%S')
 
@@ -114,6 +139,32 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
 
         # Should miss the first and last values
         result = self.dao.get_timetamped_data_range(source_id, test_metric, start_datetime, end_datetime)
+
+        # First assert length
+        self.assertEqual(len(result), len(values_inserted))
+
+        for i in range(1, len(values_inserted)):
+            self.assertEqual(result[i][0], values_inserted[i].timestamp)
+            self.assertEqual(result[i][1], values_inserted[i].data_value)
+
+    def test_should_load_all_data_for_data_range_with_no_data_in_some_hours(self):
+        source_id = 'unittest2_4'
+        test_metric = 'ramp_height'
+        start1 = datetime.strptime('1990-01-01T10:00:00', '%Y-%m-%dT%H:%M:%S')
+        end1 = datetime.strptime('1990-01-01T12:10:00', '%Y-%m-%dT%H:%M:%S')
+        # Note hole between 3 and 9
+        start2 = datetime.strptime('1990-01-01T15:00:00', '%Y-%m-%dT%H:%M:%S')
+        end2 = datetime.strptime('1990-01-01T17:20:00', '%Y-%m-%dT%H:%M:%S')
+
+        first_inserted = self.__insert_range_of_metrics(source_id, test_metric, start1, end1, batch_insert=True)
+        second_inserted = self.__insert_range_of_metrics(source_id, test_metric, start2, end2, batch_insert=True)
+
+        values_inserted = list()
+        values_inserted.extend(first_inserted)
+        values_inserted.extend(second_inserted)
+
+        # Should miss the first and last values
+        result = self.dao.get_timetamped_data_range(source_id, test_metric, start1, end2)
 
         # First assert length
         self.assertEqual(len(result), len(values_inserted))
@@ -252,12 +303,15 @@ class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
     def test_should_store_arabic_and_store_manual_index_and_load_by_free_text_search(self):
         arabic_text = u'مساعدة في تصليح كود'
         source_id = 'indexed_test_5'
-        data_name = 'evil_text'
+        data_name = 'evil_text2'
         data_value_unicode = arabic_text
         #data_value_utf8 = data_value_unicode.encode('utf-8')
-        beastly_timestamp = datetime.strptime('1983-03-01T06:06:11', '%Y-%m-%dT%H:%M:%S')
+        beastly_timestamp = datetime.strptime('1988-03-01T06:06:11', '%Y-%m-%dT%H:%M:%S')
 
         dto = TimestampedDataDTO(source_id, beastly_timestamp, data_name, data_value_unicode)
+
+        # Insert into timeseries shard
+        self.dao.insert_timestamped_data(dto)
 
         # No auto-index for this baby, create a manual index
         #self.dao.insert_indexable_text_as_blob_data_and_insert_index(dto)
@@ -279,7 +333,7 @@ class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
         self.assertEqual(result[0][1], data_value_unicode)
 
         # Now make a free text search
-        search_string = u'árabic'
+        search_string = u'works'
         result = self.dao.get_blobs_by_free_text_index(source_id, data_name, search_string)
 
         self.assertIsNotNone(result)
@@ -322,7 +376,7 @@ class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
         self.assertEqual(result[2][1], data_value_unicode3)
 
     def test_should_store_data_for_several_data_names_and_load_by_index_with_date_range(self):
-        source_id = 'indexed_test_7'
+        source_id = 'unittests.indexed_test_7'
         data_name1 = 'evil3_text'
         data_name2 = 'bad3_text'
         data_name3 = 'nasty3_text'
@@ -474,6 +528,160 @@ class StringIndexerTest(unittest.TestCase):
 
     def test_should_store_a_few_similar_string_and_their_indexes_and_load_all_by_index(self):
         pass
+
+class CassandraLoggerTest(PyCatsIntegrationTestBase):
+
+    def __assert_log_message(self, lm, source_context, log_source, timestamp, level, message):
+        self.assertEqual(lm.source_context, source_context)
+        self.assertEqual(lm.log_source, log_source)
+        self.assertEqual(lm.timestamp, timestamp)
+        self.assertEqual(lm.level, level)
+        self.assertEqual(lm.message, message)
+
+    def test_should_log_one_row_and_load_using_all_contexts(self):
+        # Given
+        logger = CassandraLogger(self.dao)
+
+        source_context = 'CassandraLoggerTest1'
+        log_source = 'unittest1'
+        timestamp = datetime.strptime('1979-06-20T06:06:06.20', '%Y-%m-%dT%H:%M:%S.%f')
+        level = 'warn'
+        message = u'This is a log message from the erste unit test.'
+
+        # When
+        logger.log(source_context, log_source, timestamp, level, message)
+
+        # Then
+        free_text = 'erste'
+
+        # 1. Find by exact context, note it returns list of LogMessageDTOs from the facade module
+        result = logger.free_text_search(free_text, source_context, log_source, level)
+        self.assertEqual(len(result), 1)
+        self.__assert_log_message(result[0], source_context, log_source, timestamp, level, message)
+
+        # 2 Find by looser context
+        result = logger.free_text_search(free_text, source_context, None, level)
+        self.assertEqual(len(result), 1)
+        self.__assert_log_message(result[0], source_context, log_source, timestamp, level, message)
+
+        # 3 Find by even more loose context, global but still within the 'info'-level
+        result = logger.free_text_search(free_text, None, None, level)
+        self.assertEqual(len(result), 1)
+        self.__assert_log_message(result[0], source_context, log_source, timestamp, level, message)
+
+        # 4 Find in über-global context
+        result = logger.free_text_search(free_text)
+        self.assertEqual(len(result), 1)
+        self.__assert_log_message(result[0], source_context, log_source, timestamp, level, message)
+
+    def test_should_log_one_row_for_three_sources_and_three_should_be_found_within_higher_contexts(self):
+        # Given
+        logger = CassandraLogger(self.dao)
+
+        source_context = 'CassandraLoggerTest2'
+        log_source1 = 'unittest1_1'
+        log_source2 = 'unittest1_2'
+        log_source3 = 'unittest1_3'
+        timestamp1 = datetime.strptime('1979-06-20T06:06:06.20', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp2 = datetime.strptime('1979-06-20T06:06:06.21', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp3 = datetime.strptime('1979-06-20T06:06:06.22', '%Y-%m-%dT%H:%M:%S.%f')
+        level = 'warn'
+        message = u'This is a log message from the second unit test.'
+
+        # When
+        logger.log(source_context, log_source1, timestamp1, level, message)
+        logger.log(source_context, log_source2, timestamp2, level, message)
+        logger.log(source_context, log_source3, timestamp3, level, message)
+
+        # Then...
+        free_text = 'second'
+
+        # 1. Find by exact context, should return 1
+        result = logger.free_text_search(free_text, source_context, log_source1, level)
+        self.assertEqual(len(result), 1)
+        self.__assert_log_message(result[0], source_context, log_source1, timestamp1, level, message)
+
+        # 2 Find by looser context, should find all three now
+        result = logger.free_text_search(free_text, source_context, None, level)
+        self.assertEqual(len(result), 3)
+        self.__assert_log_message(result[0], source_context, log_source1, timestamp1, level, message)
+        self.__assert_log_message(result[1], source_context, log_source2, timestamp2, level, message)
+        self.__assert_log_message(result[2], source_context, log_source3, timestamp3, level, message)
+
+        # 3 Find by even more loose context, global but still within the 'info'-level
+        result = logger.free_text_search(free_text, None, None, level)
+        self.assertEqual(len(result), 3)
+        self.__assert_log_message(result[0], source_context, log_source1, timestamp1, level, message)
+        self.__assert_log_message(result[1], source_context, log_source2, timestamp2, level, message)
+        self.__assert_log_message(result[2], source_context, log_source3, timestamp3, level, message)
+
+        # 4 Find in über-global context
+        result = logger.free_text_search(free_text)
+        self.assertEqual(len(result), 3)
+        self.__assert_log_message(result[0], source_context, log_source1, timestamp1, level, message)
+        self.__assert_log_message(result[1], source_context, log_source2, timestamp2, level, message)
+        self.__assert_log_message(result[2], source_context, log_source3, timestamp3, level, message)
+
+    def test_should_log_tree_row_for_three_sources_and_load_by_date_range(self):
+        # Given
+        logger = CassandraLogger(self.dao)
+
+        source_context = 'CassandraLoggerTest3'
+        log_source1 = 'unittest1_1'
+        log_source2 = 'unittest1_2'
+        log_source3 = 'unittest1_3'
+
+        timestamp1_1 = datetime.strptime('1979-06-20T06:06:06.20', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp1_2 = datetime.strptime('1979-06-20T06:06:06.21', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp1_3 = datetime.strptime('1979-06-20T06:06:06.22', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp2_1 = datetime.strptime('1979-06-20T06:06:06.23', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp2_2 = datetime.strptime('1979-06-20T06:06:06.24', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp2_3 = datetime.strptime('1979-06-20T06:06:06.25', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp3_1 = datetime.strptime('1979-06-20T06:06:06.26', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp3_2 = datetime.strptime('1979-06-20T06:06:06.27', '%Y-%m-%dT%H:%M:%S.%f')
+        timestamp3_3 = datetime.strptime('1979-06-20T06:06:06.28', '%Y-%m-%dT%H:%M:%S.%f')
+        level = 'warn'
+        message = u'In Sweden Strindberg is both known as a novelist and a playwright'
+
+        # When
+        logger.log(source_context, log_source1, timestamp1_1, level, message)
+        logger.log(source_context, log_source1, timestamp1_2, level, message)
+        logger.log(source_context, log_source1, timestamp1_3, level, message)
+
+        logger.log(source_context, log_source2, timestamp2_1, level, message)
+        logger.log(source_context, log_source2, timestamp2_2, level, message)
+        logger.log(source_context, log_source2, timestamp2_3, level, message)
+
+        logger.log(source_context, log_source3, timestamp3_1, level, message)
+        logger.log(source_context, log_source3, timestamp3_2, level, message)
+        logger.log(source_context, log_source3, timestamp3_3, level, message)
+
+        # Then...
+        free_text = 'Strindberg'
+
+        # 1. Find by exact context, should return 3 in this date span
+        # (ie provide source context, log_source and level
+        fromdate = datetime.strptime('1979-06-20T06:06:06.19', '%Y-%m-%dT%H:%M:%S.%f')
+        todate = datetime.strptime('1979-06-20T06:06:06.23', '%Y-%m-%dT%H:%M:%S.%f')
+        result = logger.load_by_date_range(source_context, log_source1, level, fromdate, todate)
+
+        self.assertEqual(len(result), 3)
+        self.__assert_log_message(result[0], source_context, log_source1, timestamp1_1, level, message)
+        self.__assert_log_message(result[1], source_context, log_source1, timestamp1_2, level, message)
+        self.__assert_log_message(result[2], source_context, log_source1, timestamp1_3, level, message)
+
+
+        # 2. now be less specific, should find all 9
+        # (ie provide source context, log_source and level
+        fromdate = datetime.strptime('1979-06-20T06:06:06.19', '%Y-%m-%dT%H:%M:%S.%f')
+        todate = datetime.strptime('1979-06-20T06:06:06.29', '%Y-%m-%dT%H:%M:%S.%f')
+        result = logger.load_by_date_range(source_context, None, level, fromdate, todate)
+
+        self.assertEqual(len(result), 9)
+
+        for lm in result:
+            print u'%s' % lm
+
 
 if __name__ == '__main__':
     unittest.main()

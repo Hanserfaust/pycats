@@ -1,12 +1,16 @@
 import time
 import pytz
+from datetime import datetime, timedelta
+import random
 
 class TimestampedDataDTO():
-    def __init__(self, source_id, timestamp, data_name, data_value):
+    # In case data_value cant be indexed, it will force the indexer to use str_for_index as base for index
+    def __init__(self, source_id, timestamp, data_name, data_value, str_for_index=None):
         self.source_id = source_id
         self.timestamp = timestamp
         self.data_name = data_name
-        self.data_value = data_value
+        self.data_value = data_value            # Will be put as data payload
+        self.str_for_index = str_for_index      # Will be used as base for index if set
 
     @staticmethod
     def generate_source_id(namespace, uid):
@@ -28,7 +32,7 @@ class TimestampedDataDTO():
         time_part = self.timestamp_as_utc().strftime('%Y%m%d%H')
         return str(self.source_id+'-'+self.data_name+'-'+time_part)
 
-    # No need for a busness-key. a hash of the data could work just as well (better?)
+    # A nice hash for the data would be better
     def get_row_key_for_blob_data(self):
         time_part = str(self.timestamp_as_unix_time_millis(self.timestamp_as_utc()))
         return str(self.source_id+'-'+self.data_name+'-'+time_part)
