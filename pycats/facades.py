@@ -39,20 +39,26 @@ class LogMessageDTO():
     def __unicode__(self):
         return u'%s from %s.%s (%s) : %s' % (self.timestamp, self.source_context, self.log_source, self.level, self.message)
 
-GLOBAL_CONTEXT = '__gc__'
-ANY_LEVEL = 'any'
+GLOBAL_CONTEXT = '__clg_glb__'
+ANY_LEVEL = '__clg_any__'
 
 seconds_per_day = 60*60*24
 
 class CassandraLogger():
 
-    global_context_tag = '__gc__'
     supported_log_levels = ['info', 'warn', 'error', 'debug']
 
     # Filter for the three context. no need to store info and debug on higher context is a good assumption
     levels_for_exact            = ['info', 'warn', 'error', 'debug']
     levels_for_source_context   = ['warn', 'error']
     levels_for_global_context   = ['warn', 'error']
+
+    # Internal hidden data_names, in case the source stores other stuff
+    ext_level_to_internal = {'info' : '__clg_info__',
+                            'warn' : '__clg_warn__',
+                            'error' : '__clg_error__',
+                            'debug' : '__clg_debug__',
+                            }
 
     # It is probably a good idea to use a separate DAO in a separate keyspace for the logging purposes
     # One idea could be to use the nice Cassandra feature of TTL on the log messages,
@@ -77,6 +83,18 @@ class CassandraLogger():
     def _build_pycats_source_id(self, source_context, log_source):
         return source_context+'.'+log_source
 
+    def info(self, source_context, log_source, timestamp, message):
+        return self.log(source_context, log_source, timestamp, 'info', message)
+
+    def warn(self, source_context, log_source, timestamp, message):
+        return self.log(source_context, log_source, timestamp, 'warn', message)
+
+    def error(self, source_context, log_source, timestamp, message):
+        return self.log(source_context, log_source, timestamp, 'error', message)
+
+    def debug(self, source_context, log_source, timestamp, message):
+        return self.log(source_context, log_source, timestamp, 'debug', message)
+
     # source_context offers a higher level of grouping. if you dont need that level
     # just provide a string that all calls shares, such as 'app'. It could be used
     # for concepts such as projects, namespaces, user groups, companys etc
@@ -98,21 +116,23 @@ class CassandraLogger():
         dto_global_and_level    = None
         dto_global_and_any      = None
 
+        level_as_data_name = self.ext_level_to_internal[level]
+
         if level in self.levels_for_exact:
             # ... load based on exact source and exact level
-            dto_source_and_level = TimestampedDataDTO(self._build_pycats_source_id(source_context,log_source), timestamp, level, internal_message, message)
+            dto_source_and_level = TimestampedDataDTO(self._build_pycats_source_id(source_context,log_source), timestamp, level_as_data_name, internal_message, message)
             # ... load based on any level but exact source
             dto_source_and_any =  TimestampedDataDTO(self._build_pycats_source_id(source_context,log_source), timestamp, ANY_LEVEL, internal_message, message)
         if level in self.levels_for_source_context:
             # ... load logs independently of ID within context, but with exact log level
-            dto_context_and_level = TimestampedDataDTO(source_context, timestamp, level, internal_message, message)
+            dto_context_and_level = TimestampedDataDTO(source_context, timestamp, level_as_data_name, internal_message, message)
             # ... load logs independently of ID within context, and independent of level
             dto_context_and_any =  TimestampedDataDTO(source_context, timestamp, ANY_LEVEL, internal_message, message)
         if level in self.levels_for_global_context:
             # ... load logs globally with specific level
-            dto_global_and_level = TimestampedDataDTO(self.global_context_tag, timestamp, level, internal_message, message)
+            dto_global_and_level = TimestampedDataDTO(GLOBAL_CONTEXT, timestamp, level_as_data_name, internal_message, message)
             # ... load logs globally independent of level
-            dto_global_and_any =  TimestampedDataDTO(self.global_context_tag, timestamp, ANY_LEVEL, internal_message, message)
+            dto_global_and_any =  TimestampedDataDTO(GLOBAL_CONTEXT, timestamp, ANY_LEVEL, internal_message, message)
 
         # If same TTL, store with one call
         if self.ttl_secs_for_exact == self.ttl_secs_for_source_context and self.ttl_secs_for_exact == self.ttl_secs_for_global_context:
@@ -135,7 +155,7 @@ class CassandraLogger():
             raise LogLoadingArgumentErrorException('Neither free text, nor time-span was supplied.')
 
         if level:
-            data_name = level
+            data_name = self.ext_level_to_internal[level]
         else:
             data_name = ANY_LEVEL
 

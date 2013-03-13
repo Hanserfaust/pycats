@@ -439,13 +439,13 @@ class StringIndexerTest(unittest.TestCase):
     def test_should_split_complex_string_into_indexable_words(self):
 
         # Given
-        test_string = u'<1921___.bg three cäts!Left__hôme(early)-In.Two.CARS'
+        test_string = u'<1921___.bg three cäts!Left__hôme(early)-In.Two.CARS really?'
 
         # When
         result = self.string_indexer.strip_and_lower(test_string)
 
         # Then
-        expected_result = '1921 bg three c\xc3\xa4ts left h\xc3\xb4me early in two cars'
+        expected_result = '1921 bg three c\xc3\xa4ts left h\xc3\xb4me early in two cars really'
         self.assertEqual(expected_result, result)
 
 
@@ -681,6 +681,13 @@ class CassandraLoggerTest(PyCatsIntegrationTestBase):
 
         for lm in result:
             print u'%s' % lm
+
+        # 3. Same as last, but choose a date outside the inserted range, should find 0
+        fromdate = datetime.strptime('1939-06-20T06:06:06.19', '%Y-%m-%dT%H:%M:%S.%f')
+        todate = datetime.strptime('1939-06-20T06:06:06.29', '%Y-%m-%dT%H:%M:%S.%f')
+        result = logger.load_by_date_range(source_context, None, level, fromdate, todate)
+
+        self.assertEqual(len(result), 0)
 
 
 if __name__ == '__main__':

@@ -355,8 +355,8 @@ class TimeSeriesCassandraDao():
         result = list()
         shards = list()
         keys_to_full_shards = list()
-        first_shard = []
-        last_shard = []
+        first_shard = None
+        last_shard = None
 
         if len(datetimes) == 0:
             return []
@@ -387,6 +387,8 @@ class TimeSeriesCassandraDao():
 
         # Shards contain hourly data.. need to straighten it out and convert the high-res timestamp
         for shard in shards:
+            if not shard:
+                continue
             row_key = shard[0]
             # Restore date from rowkey and column name (which is pico-time offset).. this is wierd... but it works
             floored_datetime_from_key = row_key.split('-')[-1]
@@ -409,7 +411,7 @@ class StringIndexer():
     # Makes a good base to create index from
     def strip_and_lower(self, string):
         # Split only on a couple of separators an do lower
-        r1 = re.sub('[,\.\-=!@#$\(\)<>_\[\]\'\"\´\:]', ' ', string.lower())
+        r1 = re.sub('[,\.\-\?=!@#$\(\)<>_\[\]\'\"\´\:]', ' ', string.lower())
         r2 = ' '.join(r1.split())
         return r2.encode('utf-8')
 
