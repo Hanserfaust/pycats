@@ -1,16 +1,10 @@
 # -*- coding: utf-8 -*-
 import pycassa
 from pycassa.cassandra.ttypes import NotFoundException
-import pytz
-import time
 from datetime import datetime, timedelta
-from logging import debug, error, info
-import re
-import string
 from models import TimestampedDataDTO, BlobIndexDTO
 import random
-from collections import OrderedDict
-
+import indexers
 
 MAX_COLUMNS = 60*60*24
 CACHE_TTL = 8*60*60 # 8 hours
@@ -19,41 +13,17 @@ MAX_TIME = datetime.strptime('2900-01-01T01:59:59', '%Y-%m-%dT%H:%M:%S')
 
 #
 #
-# Known limitations:
-#    Timestamps as column-names-problem:
-#       Since the time series are stored in shards of one hour, the implementation
-#       uses the timestamp as column name (yes sort of wierd), and in Cassandra
-#       dates are treated as unsigned long (64-bit) number representing the number
-#       of milliseconds since "the epoch". We can store 1000 values per second assuming
-#       the values don't share timetamp for each row-key. But what if they do? what if the same source
-#       want to store several values for the same timestamp. The problem arises when
-#       the source provides a timestamp to the data with low precision (ie no milliseconds
-#       supplied in the timestamp), in that situation and there may
-#       arise the situation where several data-posts share timestamp. In common data
-#       storage solution (SQL), the values would be added in order, but in this
-#       hourly-shard model employed in this solution, for one row, there can not be
-#       two columns with the same name (the timestamp is the column name). If they
-#       share name, the last will overwrite the earlier value.
+# TODO: Insert link to a few figures that explain what this class is up to.
 #
-#       (Note that the colission risk is only when two posts share the same exact row
-#       key, ie the combination of source_id, data_name and hour-shard)
+# Warning: Code looks overly complex and is in need of refactoring:
 #
-#       A solution is to say we only provide second-resolution and uses the millisecond
-#       value as a mean to avoid the collision described. For that to work, we
-#       would like to make sure two data posts never share the millisecond-figure.
-#
-#       In a single-deployment system, this can be made quite robust, but in a multi-tier
-#       system, this can prove to be a challenge, there is always a risk that the
-#       different systems chooses the same millisecond-figure.
-#
-#       Implement your strategy in the method __add_millis_to_timestamp(), i provide
-#       a simple randomizer that does the job in the small to medium scale.
-#
-#       Other solution could be to not use a date since epoch as column name, but
-#       instead calculate nanoseconds since the shard-hour-start. Upon data-load, you
-#       would need to convert the each nanosecond-offset to the correct datetime.
-#
-#       Actually, an hour of pico-seconds fits into a 64-bit long!
+# Known fuzzyness:
+#   - Code has chaned drastically a few times, hence old names may still appear
+#   - Code looks overly complex
+#   - Caching solution was implemented, but disabled again. Needs to be fixed for performance
+#   - Variable names related to the DTOs does not have unified names over the code base
+#   - StringIndexer class should be moved out
+#   - Explain why the column names in the time-series ColumnFamily needs pico-second precision
 #
 # See tests.py for details on how to setup the required keyspace and ColumnFamilies
 #
@@ -71,7 +41,8 @@ class TimeSeriesCassandraDao():
     # Maybe the dao should be un-aware of the indexer, break out and make it cleaner?
     blob_indexer = None
 
-    def __init__(self, cassandra_hosts, key_space, cache=None, warm_up_cache_shards=0, disable_high_res_column_name_randomization=False):
+    # Important: keep the randomizer on in production environments to avoid collisions (overwrites) in the time-series CF to a minimum
+    def __init__(self, cassandra_hosts, key_space, cache=None, warm_up_cache_shards=0, disable_high_res_column_name_randomization=False, index_depth=5):
         self.__cassandra_hosts = cassandra_hosts
         self.__key_space = key_space
         self.__pool = pycassa.ConnectionPool(self.__key_space, self.__cassandra_hosts)
@@ -80,7 +51,7 @@ class TimeSeriesCassandraDao():
         self.daily_gets = 0
         self.millis = 0
         self.__warm_up_cache_shards = warm_up_cache_shards
-        self.blob_indexer = StringIndexer()
+        self.blob_indexer = indexers.StringIndexer(index_depth)
         self.disable_high_res_column_name_randomization = disable_high_res_column_name_randomization
 
     def __get_hourly_data_cf(self):
@@ -93,23 +64,24 @@ class TimeSeriesCassandraDao():
         return pycassa.ColumnFamily(self.__pool, self.BLOB_DATA_INDEX_COLUMN_FAMILY_NAME)
 
     # Convert datetime object to millisecond precision unix epoch
-    def __unix_time_millis(self, dt):
-        return long(time.mktime(dt.timetuple())*1e3 + dt.microsecond/1e3)
+#    def __unix_time_millis(self, dt):
+#        return long(time.mktime(dt.timetuple())*1e3 + dt.microsecond/1e3)
+#
+#    def __datetime_to_utc(self, a_datetime):
+#        if a_datetime.tzinfo:
+#            return a_datetime.astimezone (pytz.utc)
+#        else:
+#            return a_datetime
+#
+#    def __from_unix_time_millis(self, unix_time_millis):
+#        seconds = unix_time_millis / 1000
+#        millis = unix_time_millis - seconds
+#        the_datetime = datetime.utcfromtimestamp(seconds)
+#        the_datetime + timedelta(milliseconds=millis)
+#        return the_datetime
 
-    def __datetime_to_utc(self, a_datetime):
-        if a_datetime.tzinfo:
-            return a_datetime.astimezone (pytz.utc)
-        else:
-            return a_datetime
-
-    def __from_unix_time_millis(self, unix_time_millis):
-        seconds = unix_time_millis / 1000
-        millis = unix_time_millis - seconds
-        the_datetime = datetime.utcfromtimestamp(seconds)
-        the_datetime + timedelta(milliseconds=millis)
-        return the_datetime
-
-    # TODO: bleeeeh.. how ugly, can some just optimize this???
+    # Legacy for cache solution,
+    # alternative: could just compare a floored datetime to a floored "now"
     def __datetime_is_in_now_hour(self, a_datetime):
         now = datetime.utcnow()
         if now.year != a_datetime.year:
@@ -121,22 +93,6 @@ class TimeSeriesCassandraDao():
         if now.hour != a_datetime.hour:
             return False
         return True
-
-    # TODO: dumb stuff, use get_slice of the pycassa library instead FFS!!!
-    def __get_slice_of_shard(self, shard, start_datetime, end_datetime):
-        truncated_shard = list()
-
-        if not start_datetime:
-            start_datetime = self.__from_unix_time_millis(0)
-
-        if not end_datetime:
-            end_datetime = MAX_TIME
-
-        for tuple in shard:
-            the_datetime = self.highres_to_utc_datetime(tuple[0])
-            if the_datetime >= start_datetime and the_datetime <=end_datetime:
-                truncated_shard.append((the_datetime, tuple[1]))
-        return truncated_shard
 
     def __get_picoseconds_since_start_of_hour(self, timestamp):
         # This is as accurate as a python datetime object can be
@@ -399,73 +355,3 @@ class TimeSeriesCassandraDao():
                 result.append((the_datetime, tuple[1]))
 
         return result
-
-# Can index a blob that is a valid utf-8 string. If blob is not a valid utf-8 (ie. a png-imgage, skip
-# this and create a few tags manually)
-class StringIndexer():
-    white_list = string.letters + string.digits + ' '
-    index_depth = 5
-    #default_ttl = 60*60*24*30 # 30 days TTL as default
-
-    # Takes a string and returns a clean string of lower-case words only
-    # Makes a good base to create index from
-    def strip_and_lower(self, string):
-        # Split only on a couple of separators an do lower
-        r1 = re.sub('[,\.\-\?=!@#$\(\)<>_\[\]\'\"\´\:]', ' ', string.lower())
-        r2 = ' '.join(r1.split())
-        return r2.encode('utf-8')
-
-        #pattern = re.compile('([^\s\w]|_)+')
-        #strippedList = pattern.sub(' ', string)
-        #return strippedList.lower().strip(' \t\n\r')
-
-
-    # Will split a sting and return the permutations given depth
-    # made for storing short scentences too use as index
-    #
-    # Example, given 'hello indexed words' and depth = 2
-    # Will return: ['hello', 'indexed', 'words', 'hello indexed', 'indexed words']
-    # ie depth equals the maximum number of words in a substring
-    #
-    # Assume string can be split on space, depth is an integer >= 1
-    def _build_substrings(self, string, depth):
-        result = set()
-        words = string.split()
-
-        for d in range(0, depth):
-            for i in range(0, len(words)):
-                if i+d+1 > len(words):
-                    continue
-                current_words = words[i:i+d+1]
-                result.add(' '.join(current_words))
-        return result
-
-    # idea: could add flag to run the loop again but with ommited source_id and/or dataname to
-    # return double and tripple amount of keys to make a global search available
-    def build_indexes_from_timstamped_dto(self, dto, blob_data_row_key):
-        if dto.str_for_index:
-            indexable_string = self.strip_and_lower(dto.str_for_index)
-        else:
-            indexable_string = self.strip_and_lower(dto.data_value)
-
-        substrings = self._build_substrings(indexable_string, self.index_depth)
-
-        index_dtos = []
-        for substring in substrings:
-            index_dto = BlobIndexDTO(dto.source_id, dto.data_name, substring, dto.timestamp, blob_data_row_key)
-            index_dtos.append(index_dto)
-
-        return index_dtos
-
-    def __datetime_to_utc(self, a_datetime):
-        if a_datetime.tzinfo:
-            # Convert to UTC if timezone info
-            return a_datetime.astimezone (pytz.utc)
-        else:
-            # Assume datetime was in UTC if no timezone info exists
-            return a_datetime
-
-    def __build_row_key_for_timestamped_string(self, source_id, utc_datetime):
-#        time_part = utc_datetime.strftime('%Y%m%d')
-#        return str(source_id+'-'+time_part)
-        return source_id
