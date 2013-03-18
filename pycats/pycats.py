@@ -6,7 +6,8 @@ from models import TimestampedDataDTO, BlobIndexDTO
 import random
 import indexers
 
-MAX_TIME_SERIES_COLUMN_COUNT = 60*60*24
+MAX_TIME_SERIES_TOTAL_COUNT = 1000
+MAX_TIME_SERIES_COLUMN_COUNT = 100
 MAX_INDEX_COLUMN_COUNT = 100
 MAX_BLOB_COLUMN_COUNT = 100
 
@@ -274,13 +275,12 @@ class TimeSeriesCassandraDao():
         else:
             return list_of_ordered_dicts
 
-    def __load_shard(self, row_key, from_datetime=None, to_datetime=None, column_count=MAX_TIME_SERIES_COLUMN_COUNT):
+    def __load_shard(self, row_key, from_datetime=None, to_datetime=None, column_count=MAX_TIME_SERIES_COLUMN_COUNT, allow_cached_loads=False):
         # Special case, we say we want data from a shard but range is 0, return empty then
-
         if from_datetime and to_datetime:
             if from_datetime == to_datetime:
                 #print u'skipping load'
-                return []
+                return (row_key, {})
             #print u'parital load: %s - %s' % (from_datetime, to_datetime)
             column_start = self.get_high_res_column_name(from_datetime, True)
             column_finish = self.get_high_res_column_name(to_datetime, True)
@@ -292,15 +292,20 @@ class TimeSeriesCassandraDao():
             result = self.__get_hourly_data_cf().get(row_key, column_reversed=False, column_count=column_count, column_start=column_start, column_finish=column_finish)
             return (row_key, result)
         except NotFoundException:
-            return None
+            return (row_key, {})
 
-    # Load data for given metric_name, a start and end datetime and source_id0
-    def get_timetamped_data_range(self, source_id, metric_name, start_datetime, end_datetime, column_count=MAX_TIME_SERIES_COLUMN_COUNT):
+    # Load data for given metric_name, a start and end datetime and source_id
+    #
+    # Note that max_count referres to the maximum size of the total result.
+    #
+    # Never asume the whole range will be fetched. Call will returned when max_count is reached.
+    def get_timetamped_data_range(self, source_id, metric_name, start_datetime, end_datetime, max_count=MAX_TIME_SERIES_COLUMN_COUNT, allow_cached_loads=False):
 
         # TODO: check requested range, or check how many shards we will request
         # should probably put a limit here
 
         datetimes = list()
+        maximum_allowed = max_count
 
         # TODO: check out column slice usage
 
@@ -313,9 +318,7 @@ class TimeSeriesCassandraDao():
         # load the hourly shards
         result = list()
         shards = list()
-        keys_to_full_shards = list()
-        first_shard = None
-        last_shard = None
+        key_to_last_shard = None
 
         if len(datetimes) == 0:
             return []
@@ -325,24 +328,27 @@ class TimeSeriesCassandraDao():
             shards.append(shard)
         if len(datetimes) > 1:
             for i in range(0, len(datetimes)):
+                if maximum_allowed <= 0 :
+                    # Cant go on, would be good to explicitly not this upwards?
+                    break
                 row_key = TimestampedDataDTO( source_id, datetimes[i], metric_name, None).get_row_key_for_hourly()
                 if i==0:
-                    first_shard = self.__load_shard(row_key, start_datetime, datetimes[i+1]-timedelta(microseconds=1), column_count)
-                elif i==len(datetimes)-1:
-                    last_shard = self.__load_shard(row_key, datetimes[i], end_datetime+timedelta(microseconds=1), column_count)
+                    a_shard = self.__load_shard(row_key, start_datetime, datetimes[i+1]-timedelta(microseconds=1), maximum_allowed, allow_cached_loads)
+                elif i > 0 and i < len(datetimes) -1:
+                    a_shard =  self.__load_shard(row_key, column_count=maximum_allowed, allow_cached_loads=allow_cached_loads)
                 else:
-                    # Store key for multi-get below
-                    keys_to_full_shards.append(row_key)
+                    a_shard = self.__load_shard(row_key, datetimes[len(datetimes)-1], end_datetime+timedelta(microseconds=1), maximum_allowed, allow_cached_loads)
+                maximum_allowed -= len(a_shard[1])
+                shards.append(a_shard)
 
-        if first_shard:
-            shards.append(first_shard)
-
-        if len(keys_to_full_shards) > 0:
-            multi_get_result = self.__get_hourly_data_cf().multiget(keys_to_full_shards, column_reversed=False, column_count=column_count)
-            shards.extend(multi_get_result.items())
-
-        if last_shard:
-            shards.append(last_shard)
+        # Avoid multiget for now due to uncertainty of the column_count meaning. We dont want to fetch the 100 first of many slices,
+        # leaving us with holes in the data series we are fetching
+        #
+        #if len(keys_to_full_shards) > 0:
+        #    # TODO: important, should any of the multi-fetched slices be limited
+        #    multi_get_result = self.__get_hourly_data_cf().multiget(keys_to_full_shards, column_reversed=False, column_count=maximum_allowed)
+        #    # Check if any of the shards was limited
+        #    shards.extend(multi_get_result.items())
 
         # Shards contain hourly data.. need to straighten it out and convert the high-res timestamp
         for shard in shards:
