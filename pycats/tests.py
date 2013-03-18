@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime, timedelta
-from pycats.pycats import TimeSeriesCassandraDao, TimestampedDataDTO, StringIndexer, BlobIndexDTO
+from pycats.pycats import TimeSeriesCassandraDao, TimestampedDataDTO, BlobIndexDTO
+from indexers import StringIndexer
 from facades import CassandraLogger
 import unittest
 import yaml
+from profilehooks import profile
 
+import cProfile
 # Tips to get started with pycats:
 #
 # 0) Create test_settings.yaml, it has one line like this: "cassandra_host1 : ec2-somenumbers123.compute.amazonaws.com" without quotes
@@ -15,6 +18,8 @@ import yaml
 #     http://www.datastax.com/docs/1.2/install/install_ami
 # 2) Make sure you have access to the cassandra Thrift ports on the instance (configure security groups correctly)
 # 3) SSH to the cassandra host and execute the CQL needed to prepare the Columnfamilies, ie:
+#
+# Ref: http://cassandra.apache.org/doc/cql/CQL.html#CREATECOLUMNFAMILY
 #
 #    ubuntu@ip-10-10-10-2:~$ cqlsh
 #    Connected to CassandraTest at localhost:9160.
@@ -35,11 +40,6 @@ import yaml
 #
 class PyCatsIntegrationTestBase(unittest.TestCase):
 
-    # CQL to create the MetricHourlyFloat column family
-    #
-    # CREATE COLUMNFAMILY HourlyFloat (KEY ascii PRIMARY KEY) WITH comparator=timestamp AND default_validation=float;
-    #
-    # Ref: http://cassandra.apache.org/doc/cql/CQL.html#CREATECOLUMNFAMILY
     #
     def setUp(self):
         # test_settings.yaml has one line like this: "cassandra_host1 : ec2-somenumbers123.compute.amazonaws.com" without quotes
@@ -574,6 +574,7 @@ class CassandraLoggerTest(PyCatsIntegrationTestBase):
         self.assertEqual(len(result), 1)
         self.__assert_log_message(result[0], source_context, log_source, timestamp, level, message)
 
+    #@profile(immediate=True)
     def test_should_log_one_row_for_three_sources_and_three_should_be_found_within_higher_contexts(self):
         # Given
         logger = CassandraLogger(self.dao)

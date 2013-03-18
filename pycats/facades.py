@@ -87,8 +87,9 @@ class CassandraLogger():
         # and a level-independent tag
         internal_message = self._external_to_internal_message(source_context, log_source, level, message)
 
-        # big-data-weirdness-deluxe you say? No, we quadruple the message for fast key to value lookup
-        # for a number of common cases :
+        # big-data-weirdness-deluxe you say? No, we store multiple copies of the message for fast key to value lookup
+        # for a number of common cases of lookups. Need more ways to find your data? Don't alter your query as your
+        # mother did, but add other kinds of key-compositions and store another copy.
         dto_source_and_level    = None
         dto_source_and_any      = None
         dto_context_and_level   = None
@@ -128,7 +129,7 @@ class CassandraLogger():
     # Note, if log_source is provided a source_context must also be provided
     #
     # start_date and end_date can always be provided
-    def __load(self, free_text=None, source_context=None, log_source=None, level=None, start_date=None, end_date=None):
+    def __load(self, free_text=None, source_context=None, log_source=None, level=None, start_date=None, end_date=None, max_count=100):
 
         if log_source and not source_context:
             raise LogLoadingArgumentErrorException('If log source is specified, a source context must also be provided.')
@@ -149,9 +150,9 @@ class CassandraLogger():
             source_id = GLOBAL_CONTEXT
 
         if free_text:
-            list_of_tuples = self.dao.get_blobs_by_free_text_index(source_id, data_name, free_text, start_date, end_date)
+            list_of_tuples = self.dao.get_blobs_by_free_text_index(source_id, data_name, free_text, start_date, end_date, True, max_count)
         else:
-            list_of_tuples = self.dao.get_timetamped_data_range(source_id, data_name, start_date, end_date)
+            list_of_tuples = self.dao.get_timetamped_data_range(source_id, data_name, start_date, end_date, max_count)
 
         result = list()
 
@@ -165,11 +166,11 @@ class CassandraLogger():
         # Should be ordered by ascending time
         return result
 
-    def free_text_search(self, free_text=None, source_context=None, log_source=None, level=None, start_date=None, end_date=None):
-        return self.__load(free_text, source_context, log_source, level, start_date, end_date)
+    def free_text_search(self, free_text=None, source_context=None, log_source=None, level=None, start_date=None, end_date=None, max_count=100):
+        return self.__load(free_text, source_context, log_source, level, start_date, end_date, max_count)
 
-    def load_by_date_range(self, source_context=None, log_source=None, level=None, start_date=None, end_date=None):
-        return self.__load(free_text=None, source_context=source_context, log_source=log_source, level=level, start_date=start_date, end_date=end_date)
+    def load_by_date_range(self, source_context=None, log_source=None, level=None, start_date=None, end_date=None, max_count=100):
+        return self.__load(free_text=None, source_context=source_context, log_source=log_source, level=level, start_date=start_date, end_date=end_date, max_count=max_count)
 
 class UnsupportedLogLevelException(Exception):
     pass

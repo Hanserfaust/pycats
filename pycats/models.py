@@ -16,18 +16,6 @@ class TimestampedDataDTO():
     def generate_source_id(namespace, uid):
         return namespace + '.' + uid
 
-    def get_pycassa_hourly_insert_tuple(self, dto):
-        row_key = self.get_row_key_for_hourly()
-        col_name = self.timestamp_as_utc()
-        col_value = self.data_value
-        return (row_key, {col_name : col_value})
-
-    def get_pycassa_blob_insert_tuple(self, dto):
-        row_key = self.get_row_key_for_blob_data()
-        col_name = self.timestamp_as_utc()
-        col_value = self.data_value
-        return (row_key, {col_name : col_value})
-
     def get_row_key_for_hourly(self):
         time_part = self.timestamp_as_utc().strftime('%Y%m%d%H')
         return str(self.source_id+'-'+self.data_name+'-'+time_part)

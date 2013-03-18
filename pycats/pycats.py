@@ -6,7 +6,10 @@ from models import TimestampedDataDTO, BlobIndexDTO
 import random
 import indexers
 
-MAX_COLUMNS = 60*60*24
+MAX_TIME_SERIES_COLUMN_COUNT = 60*60*24
+MAX_INDEX_COLUMN_COUNT = 100
+MAX_BLOB_COLUMN_COUNT = 100
+
 CACHE_TTL = 8*60*60 # 8 hours
 # Sorry we are not Y10K compatible, just need something surely beyond anything reasonable
 MAX_TIME = datetime.strptime('2900-01-01T01:59:59', '%Y-%m-%dT%H:%M:%S')
@@ -217,28 +220,28 @@ class TimeSeriesCassandraDao():
     ######################################################
 
     # Given a list of data_names search for same string in them
-    def get_blobs_multi_data_by_free_text_index(self, source_id, data_names, free_text, start_date=None, end_date=None, to_list_of_tuples=True):
+    def get_blobs_multi_data_by_free_text_index(self, source_id, data_names, free_text, start_date=None, end_date=None, to_list_of_tuples=True, column_count=MAX_INDEX_COLUMN_COUNT):
         blob_index_rows = list()
 
         for data_name in data_names:
-            blob_index_rows.append(self.get_blob_index_row(source_id, data_name, free_text, start_date, end_date))
+            blob_index_rows.append(self.get_blob_index_row(source_id, data_name, free_text, start_date, end_date, column_count))
 
         return self.get_blobs_by_kyes(blob_index_rows, to_list_of_tuples)
 
-    def get_blob_index_row(self, source_id, data_name, free_text, start_date="", end_date=""):
+    def get_blob_index_row(self, source_id, data_name, free_text, start_date="", end_date="", column_count=MAX_INDEX_COLUMN_COUNT):
         scrubbed_free_text = self.blob_indexer.strip_and_lower(free_text)
         # We dont need the DTO, Just create one for key generation
         index_row_key = BlobIndexDTO(source_id, data_name, scrubbed_free_text, None, None).get_row_key()
         try:
             # Note, a row contains many keys
             if start_date and end_date:
-                blob_index_row = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=MAX_COLUMNS, column_start=start_date, column_finish=end_date).items()
+                blob_index_row = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=column_count, column_start=start_date, column_finish=end_date).items()
             elif start_date and not end_date:
-                blob_index_row = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=MAX_COLUMNS, column_start=start_date, column_finish="").items()
+                blob_index_row = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=column_count, column_start=start_date, column_finish="").items()
             elif end_date and not start_date:
-                blob_index_row = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=MAX_COLUMNS, column_start="", column_finish=end_date).items()
+                blob_index_row = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=column_count, column_start="", column_finish=end_date).items()
             else:
-                blob_index_row = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=MAX_COLUMNS, column_start="", column_finish="").items()
+                blob_index_row = self.__get_blob_data_index_cf().get(index_row_key, column_reversed=False, column_count=column_count, column_start="", column_finish="").items()
 
         except NotFoundException as e:
             # Differ between not found in Index and not found in Blob-CF (the load done in get_blobs_by_kyes()) which would be a serious error.
@@ -246,11 +249,11 @@ class TimeSeriesCassandraDao():
 
         return blob_index_row
 
-    def get_blobs_by_free_text_index(self, source_id, data_name, free_text, start_date=None, end_date=None, to_list_of_tuples=True):
-        blob_index_row = self.get_blob_index_row(source_id, data_name, free_text, start_date, end_date)
-        return self.get_blobs_by_kyes([blob_index_row], to_list_of_tuples)
+    def get_blobs_by_free_text_index(self, source_id, data_name, free_text, start_date=None, end_date=None, to_list_of_tuples=True, column_count=MAX_INDEX_COLUMN_COUNT):
+        blob_index_row = self.get_blob_index_row(source_id, data_name, free_text, start_date, end_date, column_count)
+        return self.get_blobs_by_kyes([blob_index_row], to_list_of_tuples, column_count)
 
-    def get_blobs_by_kyes(self, blob_index_rows, to_list_of_tuples=True):
+    def get_blobs_by_kyes(self, blob_index_rows, to_list_of_tuples=True, column_count=MAX_BLOB_COLUMN_COUNT):
         ts_data_row_keys_to_multi_fetch = list()
 
         for blob_index_row in blob_index_rows:
@@ -260,7 +263,7 @@ class TimeSeriesCassandraDao():
                 ts_data_row_keys_to_multi_fetch.append(ts_data_row_key)
 
         # Drop the key from the result by calling .values()
-        list_of_ordered_dicts = self.__get_blob_data_cf().multiget(ts_data_row_keys_to_multi_fetch).values()
+        list_of_ordered_dicts = self.__get_blob_data_cf().multiget(ts_data_row_keys_to_multi_fetch, column_count=column_count).values()
 
         if to_list_of_tuples:
             list_of_tuples = list()
@@ -271,7 +274,7 @@ class TimeSeriesCassandraDao():
         else:
             return list_of_ordered_dicts
 
-    def __load_shard(self, row_key, from_datetime=None, to_datetime=None):
+    def __load_shard(self, row_key, from_datetime=None, to_datetime=None, column_count=MAX_TIME_SERIES_COLUMN_COUNT):
         # Special case, we say we want data from a shard but range is 0, return empty then
 
         if from_datetime and to_datetime:
@@ -286,13 +289,13 @@ class TimeSeriesCassandraDao():
             column_start = ""
             column_finish = ""
         try:
-            result = self.__get_hourly_data_cf().get(row_key, column_reversed=False, column_count=MAX_COLUMNS, column_start=column_start, column_finish=column_finish)
+            result = self.__get_hourly_data_cf().get(row_key, column_reversed=False, column_count=column_count, column_start=column_start, column_finish=column_finish)
             return (row_key, result)
         except NotFoundException:
             return None
 
-    # Load data for given metric_name, a start and end datetime and source_id
-    def get_timetamped_data_range(self, source_id, metric_name, start_datetime, end_datetime):
+    # Load data for given metric_name, a start and end datetime and source_id0
+    def get_timetamped_data_range(self, source_id, metric_name, start_datetime, end_datetime, column_count=MAX_TIME_SERIES_COLUMN_COUNT):
 
         # TODO: check requested range, or check how many shards we will request
         # should probably put a limit here
@@ -324,9 +327,9 @@ class TimeSeriesCassandraDao():
             for i in range(0, len(datetimes)):
                 row_key = TimestampedDataDTO( source_id, datetimes[i], metric_name, None).get_row_key_for_hourly()
                 if i==0:
-                    first_shard = self.__load_shard(row_key, start_datetime, datetimes[i+1]-timedelta(microseconds=1))
+                    first_shard = self.__load_shard(row_key, start_datetime, datetimes[i+1]-timedelta(microseconds=1), column_count)
                 elif i==len(datetimes)-1:
-                    last_shard = self.__load_shard(row_key, datetimes[i], end_datetime+timedelta(microseconds=1))
+                    last_shard = self.__load_shard(row_key, datetimes[i], end_datetime+timedelta(microseconds=1), column_count)
                 else:
                     # Store key for multi-get below
                     keys_to_full_shards.append(row_key)
@@ -335,7 +338,7 @@ class TimeSeriesCassandraDao():
             shards.append(first_shard)
 
         if len(keys_to_full_shards) > 0:
-            multi_get_result = self.__get_hourly_data_cf().multiget(keys_to_full_shards, column_reversed=False, column_count=MAX_COLUMNS)
+            multi_get_result = self.__get_hourly_data_cf().multiget(keys_to_full_shards, column_reversed=False, column_count=column_count)
             shards.extend(multi_get_result.items())
 
         if last_shard:
