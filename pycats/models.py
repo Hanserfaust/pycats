@@ -16,6 +16,9 @@ class TimestampedDataDTO():
     def generate_source_id(namespace, uid):
         return namespace + '.' + uid
 
+    def get_row_key_for_latest(self):
+        return self.source_id
+
     def get_row_key_for_hourly(self):
         time_part = self.timestamp_as_utc().strftime('%Y%m%d%H')
         return str(self.source_id+'-'+self.data_name+'-'+time_part)
@@ -31,7 +34,9 @@ class TimestampedDataDTO():
         else:
             return self.timestamp
 
-    def timestamp_as_unix_time_millis(self, dt):
+    def timestamp_as_unix_time_millis(self, dt=None):
+        if not dt:
+            dt = self.timestamp_as_utc()
         return long(time.mktime(dt.timetuple())*1e3 + dt.microsecond/1e3)
 
     def __unicode__(self):

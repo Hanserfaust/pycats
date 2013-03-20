@@ -4,6 +4,7 @@ from pycassa.cassandra.ttypes import NotFoundException
 from datetime import datetime, timedelta
 from models import TimestampedDataDTO, BlobIndexDTO
 import random
+import pytz
 import indexers
 
 MAX_TIME_SERIES_TOTAL_COUNT = 1000
@@ -33,8 +34,12 @@ MAX_TIME = datetime.strptime('2900-01-01T01:59:59', '%Y-%m-%dT%H:%M:%S')
 #
 ####################################################################################
 class TimeSeriesCassandraDao():
+
     #  CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=timestamp;
     HOURLY_DATA_COLUMN_FAMILY_NAME = 'HourlyTimestampedData'
+
+    #  CREATE COLUMNFAMILY LatestData (KEY ascii PRIMARY KEY) WITH comparator=ascii;
+    LATEST_DATA_COLUMN_FAMILY_NAME = 'LatestData'
 
     # CREATE COLUMNFAMILY BlobData (KEY ascii PRIMARY KEY) WITH comparator=timestamp;
     BLOB_DATA_COLUMN_FAMILY_NAME = 'BlobData'
@@ -59,7 +64,10 @@ class TimeSeriesCassandraDao():
         self.disable_high_res_column_name_randomization = disable_high_res_column_name_randomization
 
     def __get_hourly_data_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME, )
+        return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME)
+
+    def __get_latest_data_cf(self):
+        return pycassa.ColumnFamily(self.__pool, self.LATEST_DATA_COLUMN_FAMILY_NAME)
 
     def __get_blob_data_cf(self):
         return pycassa.ColumnFamily(self.__pool, self.BLOB_DATA_COLUMN_FAMILY_NAME)
@@ -111,7 +119,7 @@ class TimeSeriesCassandraDao():
         else:
             # Note that the randomization is beyond micro-second precision, so it wont affect the timetamp upon load of data
             # Only the value used as column name
-            return self.__get_picoseconds_since_start_of_hour(timestamp) + random.randint(0, 10**6)
+            return self.__get_picoseconds_since_start_of_hour(timestamp) + random.randint(1, 10**6)
 
     def highres_to_utc_datetime(self, timestamp_for_start_of_hour, picos_since_start_of_hour):
         micros = (picos_since_start_of_hour / 10**6)
@@ -167,26 +175,50 @@ class TimeSeriesCassandraDao():
         # 4 batch insert the indexes
         self.batch_insert_indexes(list_of_blob_index_dtos, ttl)
 
-    def insert_timestamped_data(self, ts_data_dto, ttl=None):
+    def create_insert_dict_for_latest_data(self, data_name, data_value, timestamp):
+        return  {data_name : data_value, data_name+'-ts' : str(timestamp)}
+
+    def insert_latest_data(self, dto):
+        last_ts = 0
+        this_ts = dto.timestamp_as_unix_time_millis()
+        try:
+            last_latest_data = self.load_latest_data(dto.source_id)
+            last_ts = int(last_latest_data[dto.data_name+'-ts'])
+        except NotFoundException:
+            # Source did not store any data before
+            pass
+        except KeyError:
+            # Source stored data, but this data_name is new
+            pass
+        if this_ts > last_ts:
+            self.__get_latest_data_cf().insert(dto.source_id, self.create_insert_dict_for_latest_data(dto.data_name, dto.data_value, this_ts))
+
+    def insert_timestamped_data(self, ts_data_dto, ttl=None, set_latest=False):
         # UTF-8 encode?
         column_name = self.get_high_res_column_name(ts_data_dto.timestamp_as_utc())
         result = self.__get_hourly_data_cf().insert(ts_data_dto.get_row_key_for_hourly(), {column_name : ts_data_dto.data_value}, ttl=ttl)
+        if set_latest:
+            self.insert_latest_data(ts_data_dto)
         return result
 
     # Will only insert into the shards
-    def batch_insert_timestamped_data(self, list_of_timestamped_data_dtos, ttl=None):
-        insert_tuples = dict()
+    def batch_insert_timestamped_data(self, list_of_timestamped_data_dtos, ttl=None, set_latest=False):
+        hourly_insert_dict = dict()
 
         for dto in list_of_timestamped_data_dtos:
-            horuly_shard_row_key = dto.get_row_key_for_hourly()
-            col_name_value_pairs = insert_tuples.get(horuly_shard_row_key, None)
+            hourly_shard_row_key = dto.get_row_key_for_hourly()
+            col_name_value_pairs = hourly_insert_dict.get(hourly_shard_row_key, None)
             if not col_name_value_pairs:
                 col_name_value_pairs = dict()
             column_name = self.get_high_res_column_name(dto.timestamp_as_utc())
             col_name_value_pairs[column_name] = dto.data_value
-            insert_tuples[horuly_shard_row_key] = col_name_value_pairs
+            hourly_insert_dict[hourly_shard_row_key] = col_name_value_pairs
 
-        self.__get_hourly_data_cf().batch_insert(insert_tuples, ttl=ttl)
+        if set_latest:
+            for dto in list_of_timestamped_data_dtos:
+                self.insert_latest_data(dto)
+
+        self.__get_hourly_data_cf().batch_insert(hourly_insert_dict, ttl=ttl)
 
     def insert_blob_data(self, blob_data_dto, ttl=None):
         row_key = blob_data_dto.get_row_key_for_blob_data()
@@ -274,6 +306,16 @@ class TimeSeriesCassandraDao():
             return list_of_tuples
         else:
             return list_of_ordered_dicts
+
+    def remove_latest_data(self, source_id):
+        self.__get_latest_data_cf().remove(source_id)
+
+    def load_latest_data(self, source_id, data_name=None):
+        try:
+            latest_data = self.__get_latest_data_cf().get(source_id, super_column=data_name)
+        except NotFoundException:
+            return {}
+        return latest_data
 
     def __load_shard(self, row_key, from_datetime=None, to_datetime=None, column_count=MAX_TIME_SERIES_COLUMN_COUNT, allow_cached_loads=False):
         # Special case, we say we want data from a shard but range is 0, return empty then

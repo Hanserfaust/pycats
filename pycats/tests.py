@@ -28,6 +28,7 @@ import cProfile
 #    cqlsh> CREATE KEYSPACE pycats_test_space WITH strategy_class = 'SimpleStrategy' AND strategy_options:replication_factor = '1';
 #    cqlsh> use pycats_test_space;
 #    cqlsh:pycats_test_space> CREATE COLUMNFAMILY HourlyTimestampedData (KEY ascii PRIMARY KEY) WITH comparator=bigint;
+#    cqlsh:pycats_test_space> CREATE COLUMNFAMILY LatestData (KEY ascii PRIMARY KEY) WITH comparator=ascii;
 #    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobData (KEY ascii PRIMARY KEY) WITH comparator=timestamp;
 #    cqlsh:pycats_test_space> CREATE COLUMNFAMILY BlobDataIndex (KEY text PRIMARY KEY) WITH comparator=timestamp AND default_validation=text;
 #    cqlsh:pycats_test_space>
@@ -58,9 +59,12 @@ class PyCatsIntegrationTestBase(unittest.TestCase):
         self.dao = TimeSeriesCassandraDao(self.cassandra_hosts, self.key_space, cache=self.cache, disable_high_res_column_name_randomization=True)
         self.insert_the_test_range_into_live_db = True
 
+    def ts(self, dstr):
+        return datetime.strptime(dstr, '%Y-%m-%dT%H:%M:%S')
+
 class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
 
-    def __insert_range_of_metrics(self, source_id, value_name, start_datetime, end_datetime, batch_insert=False):
+    def __insert_range_of_metrics(self, source_id, value_name, start_datetime, end_datetime, batch_insert=False, set_latest=False):
         #
         # Insert test metrics over the days specified during setUP
         # one hour apart
@@ -77,7 +81,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
             if self.insert_the_test_range_into_live_db:
                 dto = TimestampedDataDTO(source_id, curr_datetime, value_name, str(value))
                 if not batch_insert:
-                    self.dao.insert_timestamped_data(dto)
+                    self.dao.insert_timestamped_data(dto, set_latest=set_latest)
 
                 dtos.append(dto)
             curr_datetime = curr_datetime + timedelta(minutes=20)
@@ -86,7 +90,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
 
         # And batch insert
         if batch_insert:
-            self.dao.batch_insert_timestamped_data(dtos)
+            self.dao.batch_insert_timestamped_data(dtos, set_latest=set_latest)
         return dtos
 
     def test_should_pass_a_datetime_through_high_res_column_generator_and_back(self):
@@ -96,6 +100,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
         self.assertNotEqual(a_datetime, start_of_hour)
 
         high_res_column_name = self.dao.get_high_res_column_name(a_datetime)
+        self.assertGreater(high_res_column_name, 0)
 
         resulting_datetime = self.dao.highres_to_utc_datetime(start_of_hour, high_res_column_name)
 
@@ -110,13 +115,13 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
 
         self.assertEqual(expected_floored_datetime, resulting_datetime)
 
-    def test_should_load_all_data_for_full_range_using_batch_insert(self):
+    def test_should_load_all_data_for_full_range_using_batch_insert_and_latest_should_be_correct(self):
         source_id = 'unittest1'
         test_metric = 'ramp_height'
         start_datetime = datetime.strptime('1979-12-31T22:00:00', '%Y-%m-%dT%H:%M:%S')
         end_datetime = datetime.strptime('1980-01-01T03:00:00', '%Y-%m-%dT%H:%M:%S')
 
-        values_inserted = self.__insert_range_of_metrics(source_id, test_metric, start_datetime, end_datetime, batch_insert=True)
+        values_inserted = self.__insert_range_of_metrics(source_id, test_metric, start_datetime, end_datetime, batch_insert=True, set_latest=True)
 
         # All values should be received for this date range
         result = self.dao.get_timetamped_data_range(source_id, test_metric, start_datetime, end_datetime)
@@ -128,11 +133,17 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
             self.assertEqual(result[i][0], values_inserted[i].timestamp)
             self.assertEqual(result[i][1], values_inserted[i].data_value)
 
+        # Load the latest data also
+        latest_result = self.dao.load_latest_data(source_id)
+
+        # Last of inserted
+        self.assertEqual(values_inserted[len(result)-1].data_value, latest_result[test_metric])
+
     def test_should_load_up_to_max_count_data_and_not_full_range_of_time(self):
         source_id = 'unittest1B'
         test_metric = 'ramp_height'
         start_datetime = datetime.strptime('1979-12-31T22:00:00', '%Y-%m-%dT%H:%M:%S')
-        end_datetime = datetime.strptime('1980-01-01T03:00:00', '%Y-%m-%dT%H:%M:%S')
+        end_datetime = datetime.strptime('1980-01-01T09:00:00', '%Y-%m-%dT%H:%M:%S')
 
         values_inserted = self.__insert_range_of_metrics(source_id, test_metric, start_datetime, end_datetime, batch_insert=True)
 
@@ -210,6 +221,35 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
         for i in range(0, len(result)):
             self.assertEqual(result[i][0], values_inserted[i+1].timestamp)
             self.assertEqual(result[i][1], values_inserted[i+1].data_value)
+
+    def test_should_insert_latest_data_with_different_timestamps_and_only_newest_should_be_loaded(self):
+        source_id = 'latest_test_1C'
+
+        # Ensure old test data is gone
+        self.dao.remove_latest_data(source_id)
+
+        # Ensure empty result
+        result = self.dao.load_latest_data(source_id)
+        self.assertEqual(result, {})
+
+        # Note, latest is not latest inserted, but with most recent time!
+        self.dao.insert_latest_data(TimestampedDataDTO(source_id, self.ts('2012-05-20T06:06:05'), 'temp', '5'))
+        self.dao.insert_latest_data(TimestampedDataDTO(source_id, self.ts('2012-05-20T06:06:07'), 'temp', '7')) # <= this must be loaded
+        self.dao.insert_latest_data(TimestampedDataDTO(source_id, self.ts('2012-05-20T06:06:06'), 'temp', '6'))
+        self.dao.insert_latest_data(TimestampedDataDTO(source_id, self.ts('2012-05-20T06:06:05'), 'size', '50'))
+        self.dao.insert_latest_data(TimestampedDataDTO(source_id, self.ts('2012-05-20T06:06:07'), 'size', '70')) # <= this must be loaded
+        self.dao.insert_latest_data(TimestampedDataDTO(source_id, self.ts('2012-05-20T06:06:06'), 'size', '60'))
+
+        result = self.dao.load_latest_data(source_id)
+        self.assertEqual(result['temp'], '7')
+        self.assertEqual(result['size'], '70')
+
+    def __assert_data_dict_with_timestamp(self, original, with_timestamps):
+        for key in original.keys():
+            self.assertEqual(original[key], with_timestamps[key][0])
+
+    def test_should_insert_latest_data_several_times_and_values_should_be_updated_between_runs_with_timestamps_in_result(self):
+        pass
 
 class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
     def test_should_store_a_unicode_string_and_corresponding_indexes_and_load_by_date_range_and_index(self):
