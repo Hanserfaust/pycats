@@ -25,9 +25,8 @@ MAX_TIME = datetime.strptime('2900-01-01T01:59:59', '%Y-%m-%dT%H:%M:%S')
 # Known fuzzyness:
 #   - Code has chaned drastically a few times, hence old names may still appear
 #   - Code looks overly complex
-#   - Caching solution was implemented, but disabled again. Needs to be fixed for performance
+#   - Caching solution was implemented, but disabled again. Needs to be fixed again.
 #   - Variable names related to the DTOs does not have unified names over the code base
-#   - StringIndexer class should be moved out
 #   - Explain why the column names in the time-series ColumnFamily needs pico-second precision
 #
 # See tests.py for details on how to setup the required keyspace and ColumnFamilies
@@ -51,10 +50,10 @@ class TimeSeriesCassandraDao():
     blob_indexer = None
 
     # Important: keep the randomizer on in production environments to avoid collisions (overwrites) in the time-series CF to a minimum
-    def __init__(self, cassandra_hosts, key_space, cache=None, warm_up_cache_shards=0, disable_high_res_column_name_randomization=False, index_depth=5):
+    def __init__(self, cassandra_hosts, key_space, cache=None, warm_up_cache_shards=0, disable_high_res_column_name_randomization=False, index_depth=5, pool_size=5, prefill=True):
         self.__cassandra_hosts = cassandra_hosts
         self.__key_space = key_space
-        self.__pool = pycassa.ConnectionPool(self.__key_space, self.__cassandra_hosts)
+        self.__pool = pycassa.ConnectionPool(self.__key_space, self.__cassandra_hosts, pool_size=pool_size, prefill=prefill)
         self.cache = cache
         self.cache_hits = 0
         self.daily_gets = 0
@@ -178,20 +177,29 @@ class TimeSeriesCassandraDao():
     def create_insert_dict_for_latest_data(self, data_name, data_value, timestamp):
         return  {data_name : data_value, data_name+'-ts' : str(timestamp)}
 
-    def insert_latest_data(self, dto):
+    def insert_latest_data(self, dto, verify_timestamp=True):
         last_ts = 0
         this_ts = dto.timestamp_as_unix_time_millis()
-        try:
-            last_latest_data = self.load_latest_data(dto.source_id)
-            last_ts = int(last_latest_data[dto.data_name+'-ts'])
-        except NotFoundException:
-            # Source did not store any data before
-            pass
-        except KeyError:
-            # Source stored data, but this data_name is new
-            pass
+        if verify_timestamp:
+            try:
+                last_latest_data = self.load_latest_data(dto.source_id)
+                last_ts = int(last_latest_data[dto.data_name+'-ts'])
+            except NotFoundException:
+                # Source did not store any data before
+                pass
+            except KeyError:
+                # Source stored data, but this data_name is new
+                pass
         if this_ts > last_ts:
             self.__get_latest_data_cf().insert(dto.source_id, self.create_insert_dict_for_latest_data(dto.data_name, dto.data_value, this_ts))
+
+    # Will force insert a dictionary of data using UTC now as timestamp
+    def insert_latest_data_by_dict(self, source_id, data_dict):
+        now = datetime.utcnow()
+        i_dict = dict()
+        for data_name in data_dict.keys():
+            i_dict.update(self.create_insert_dict_for_latest_data(data_name, data_dict[data_name], now))
+        self.__get_latest_data_cf().insert(source_id, i_dict)
 
     def insert_timestamped_data(self, ts_data_dto, ttl=None, set_latest=False):
         # UTF-8 encode?

@@ -69,7 +69,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
         # Insert test metrics over the days specified during setUP
         # one hour apart
         #
-        print 'Inserting test data from %s to %s' % (start_datetime, end_datetime)
+        #print 'Inserting test data from %s to %s' % (start_datetime, end_datetime)
         curr_datetime = start_datetime
 
         values_inserted = 0
@@ -243,6 +243,27 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
         result = self.dao.load_latest_data(source_id)
         self.assertEqual(result['temp'], '7')
         self.assertEqual(result['size'], '70')
+
+    def test_should_insert_latest_by_data_dict(self):
+
+        source_id = 'insert_by_dict_1'
+        data_dict = {'temp':'100', 'size':'178'}
+
+        # Ensure old test data is gone
+        self.dao.remove_latest_data(source_id)
+
+        self.dao.insert_latest_data_by_dict(source_id, data_dict)
+        result = self.dao.load_latest_data(source_id)
+        self.assertEqual(result['temp'], '100')
+        self.assertEqual(result['size'], '178')
+
+        # Change some values, add one also
+        data_dict = {'temp':'200', 'size':'278', 'length':'50'}
+        self.dao.insert_latest_data_by_dict(source_id, data_dict)
+        result = self.dao.load_latest_data(source_id)
+        self.assertEqual(result['temp'], '200')
+        self.assertEqual(result['size'], '278')
+        self.assertEqual(result['length'], '50')
 
     def __assert_data_dict_with_timestamp(self, original, with_timestamps):
         for key in original.keys():
@@ -582,11 +603,6 @@ class StringIndexerTest(unittest.TestCase):
         for index_dto in result:
             print u'Index: %s' % index_dto
 
-    def test_should_store_string_and_load_by_key(self):
-        pass
-
-    def test_should_store_a_few_similar_string_and_their_indexes_and_load_all_by_index(self):
-        pass
 
 class CassandraLoggerTest(PyCatsIntegrationTestBase):
 
@@ -682,7 +698,7 @@ class CassandraLoggerTest(PyCatsIntegrationTestBase):
         self.__assert_log_message(result[1], source_context, log_source2, timestamp2, level, message)
         self.__assert_log_message(result[2], source_context, log_source3, timestamp3, level, message)
 
-    def test_should_log_tree_row_for_three_sources_and_load_by_date_range(self):
+    def test_should_log_three_rows_for_three_sources_and_load_by_date_range(self):
         # Given
         logger = CassandraLogger(self.dao)
 
@@ -732,15 +748,12 @@ class CassandraLoggerTest(PyCatsIntegrationTestBase):
 
 
         # 2. now be less specific, should find all 9
-        # (ie provide source context, log_source and level
+        # (ie provide source context, no log_source but keep level
         fromdate = datetime.strptime('1979-06-20T06:06:06.19', '%Y-%m-%dT%H:%M:%S.%f')
         todate = datetime.strptime('1979-06-20T06:06:06.29', '%Y-%m-%dT%H:%M:%S.%f')
         result = logger.load_by_date_range(source_context, None, level, fromdate, todate)
 
         self.assertEqual(len(result), 9)
-
-        for lm in result:
-            print u'%s' % lm
 
         # 3. Same as last, but choose a date outside the inserted range, should find 0
         fromdate = datetime.strptime('1939-06-20T06:06:06.19', '%Y-%m-%dT%H:%M:%S.%f')
