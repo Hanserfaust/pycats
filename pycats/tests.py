@@ -258,7 +258,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
         self.assertEqual(result['size'], '178')
 
         # Change some values, add one also
-        data_dict = {'temp':'200', 'size':'278', 'length':'50'}
+        data_dict = {'temp': '200', 'size': '278', 'length': '50'}
         self.dao.insert_latest_data_by_dict(source_id, data_dict)
         result = self.dao.load_latest_data(source_id)
         self.assertEqual(result['temp'], '200')
@@ -271,6 +271,7 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
 
     def test_should_insert_latest_data_several_times_and_values_should_be_updated_between_runs_with_timestamps_in_result(self):
         pass
+
 
 class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
     def test_should_store_a_unicode_string_and_corresponding_indexes_and_load_by_date_range_and_index(self):
@@ -338,15 +339,18 @@ class IndexedBlobsIntegrationTests(PyCatsIntegrationTestBase):
         source_id = 'indexed_test_3'
         data_name = 'evil_text'
 
-        data_value1 = u'Hans-Eklunds-MacBook-Pro com.apple.backupd-auto[3780] <Notice>: Not stârting scheduled Time Machine backup - time machine destination not resolvable.'
+        data_value1 = u'Hans-Eklunds-MacBook-Pro com.apple.backupd-auto[3780] <Notice>: Not stârting scheduled ' \
+                      u'Time Machine backup - time machine destination not resolvable.'
         beastly_timestamp1 = datetime.strptime('1982-03-01T06:06:06', '%Y-%m-%dT%H:%M:%S')
         dto1 = TimestampedDataDTO(source_id, beastly_timestamp1, data_name, data_value1)
 
-        data_value2 = u'Hans-Smiths-MacBook-Pro com.apple.backupd-auto[3780] <Notice>: Not starting scheduled Time Machine backup - time machine destination not resolvable.'
+        data_value2 = u'Hans-Smiths-MacBook-Pro com.apple.backupd-auto[3780] <Notice>: Not starting scheduled ' \
+                      u'Time Machine backup - time machine destination not resolvable.'
         beastly_timestamp2 = datetime.strptime('1982-03-01T06:06:08', '%Y-%m-%dT%H:%M:%S')
         dto2 = TimestampedDataDTO(source_id, beastly_timestamp2, data_name, data_value2)
 
-        data_value3 = u'Hans-Johnssons-MacBook-Pro com.apple.backupd-auto[3780] <Notice>: Not starting scheduled Time Machine backup - time machine destination not resolvable.'
+        data_value3 = u'Hans-Johnssons-MacBook-Pro com.apple.backupd-auto[3780] <Notice>: Not starting scheduled ' \
+                      u'Time Machine backup - time machine destination not resolvable.'
         beastly_timestamp3 = datetime.strptime('1982-03-01T06:06:07', '%Y-%m-%dT%H:%M:%S')
         dto3 = TimestampedDataDTO(source_id, beastly_timestamp3, data_name, data_value3)
 

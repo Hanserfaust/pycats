@@ -7,8 +7,7 @@ import random
 import pytz
 import indexers
 
-MAX_TIME_SERIES_TOTAL_COUNT = 1000
-MAX_TIME_SERIES_COLUMN_COUNT = 100
+MAX_TIME_SERIES_COLUMN_COUNT = 1000
 MAX_INDEX_COLUMN_COUNT = 100
 MAX_BLOB_COLUMN_COUNT = 100
 
@@ -267,11 +266,11 @@ class TimeSeriesCassandraDao():
         for data_name in data_names:
             blob_index_rows.append(self.get_blob_index_row(source_id, data_name, free_text, start_date, end_date, column_count))
 
-        return self.get_blobs_by_kyes(blob_index_rows, to_list_of_tuples)
+        return self.get_blobs_by_keys(blob_index_rows, to_list_of_tuples)
 
     def get_blob_index_row(self, source_id, data_name, free_text, start_date="", end_date="", column_count=MAX_INDEX_COLUMN_COUNT):
         scrubbed_free_text = self.blob_indexer.strip_and_lower(free_text)
-        # We dont need the DTO, Just create one for key generation
+        # We don't need the DTO, Just create one for key generation
         index_row_key = BlobIndexDTO(source_id, data_name, scrubbed_free_text, None, None).get_row_key()
         try:
             # Note, a row contains many keys
@@ -292,18 +291,17 @@ class TimeSeriesCassandraDao():
 
     def get_blobs_by_free_text_index(self, source_id, data_name, free_text, start_date=None, end_date=None, to_list_of_tuples=True, column_count=MAX_INDEX_COLUMN_COUNT):
         blob_index_row = self.get_blob_index_row(source_id, data_name, free_text, start_date, end_date, column_count)
-        return self.get_blobs_by_kyes([blob_index_row], to_list_of_tuples, column_count)
+        return self.get_blobs_by_keys([blob_index_row], to_list_of_tuples, column_count)
 
-    def get_blobs_by_kyes(self, blob_index_rows, to_list_of_tuples=True, column_count=MAX_BLOB_COLUMN_COUNT):
+    def get_blobs_by_keys(self, blob_index_rows, to_list_of_tuples=True, column_count=MAX_BLOB_COLUMN_COUNT):
         ts_data_row_keys_to_multi_fetch = list()
 
         for blob_index_row in blob_index_rows:
             for blob_index in blob_index_row:
-                #utc_timestamp = blob_index_result[0]
                 ts_data_row_key = blob_index[1]
                 ts_data_row_keys_to_multi_fetch.append(ts_data_row_key)
 
-        # Drop the key from the result by calling .values()
+        # Drop the key from the result
         list_of_ordered_dicts = self.__get_blob_data_cf().multiget(ts_data_row_keys_to_multi_fetch, column_count=column_count).values()
 
         if to_list_of_tuples:
@@ -323,6 +321,13 @@ class TimeSeriesCassandraDao():
             latest_data = self.__get_latest_data_cf().get(source_id, super_column=data_name)
         except NotFoundException:
             return {}
+        return latest_data
+
+    def multi_load_latest_data(self, source_ids):
+        try:
+            latest_data = self.__get_latest_data_cf().multiget(source_ids)
+        except NotFoundException:
+            return []
         return latest_data
 
     def __load_shard(self, row_key, from_datetime=None, to_datetime=None, column_count=MAX_TIME_SERIES_COLUMN_COUNT, allow_cached_loads=False):
