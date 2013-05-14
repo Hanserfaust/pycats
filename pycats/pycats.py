@@ -189,6 +189,9 @@ class TimeSeriesCassandraDao():
             except KeyError:
                 # Source stored data, but this data_name is new
                 pass
+            except Exception:
+                # could not parse the timestamp, format may have change?
+                last_ts = 0
         if this_ts > last_ts:
             self.__get_latest_data_cf().insert(dto.source_id, self.create_insert_dict_for_latest_data(dto.data_name, dto.data_value, this_ts))
 
