@@ -6,6 +6,7 @@ from models import TimestampedDataDTO, BlobIndexDTO
 import random
 import pytz
 import indexers
+import time
 
 MAX_TIME_SERIES_COLUMN_COUNT = 1000
 MAX_INDEX_COLUMN_COUNT = 100
@@ -198,9 +199,10 @@ class TimeSeriesCassandraDao():
     # Will force insert a dictionary of data using UTC now as timestamp
     def insert_latest_data_by_dict(self, source_id, data_dict):
         now = datetime.utcnow()
+        timestamp = long(time.mktime(now.timetuple())*1e3 + now.microsecond/1e3)
         i_dict = dict()
         for data_name in data_dict.keys():
-            i_dict.update(self.create_insert_dict_for_latest_data(data_name, data_dict[data_name], now))
+            i_dict.update(self.create_insert_dict_for_latest_data(data_name, data_dict[data_name], timestamp))
         self.__get_latest_data_cf().insert(source_id, i_dict)
 
     def insert_timestamped_data(self, ts_data_dto, ttl=None, set_latest=False):
