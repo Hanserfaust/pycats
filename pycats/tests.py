@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime, timedelta
-from pycats.pycats import TimeSeriesCassandraDao, TimestampedDataDTO, BlobIndexDTO
+from pycats import TimeSeriesCassandraDao, TimestampedDataDTO, BlobIndexDTO
 from indexers import StringIndexer
 from facades import CassandraLogger
 import unittest
 import yaml
+import pytz
 from profilehooks import profile
 
 import cProfile
@@ -61,6 +62,49 @@ class PyCatsIntegrationTestBase(unittest.TestCase):
 
     def ts(self, dstr):
         return datetime.strptime(dstr, '%Y-%m-%dT%H:%M:%S')
+
+class TimestampedDataDTOTest(unittest.TestCase):
+
+    ##
+    ##  IMPORTANT: Naive datetimes will be treated as UTC in PyCats
+    ##
+
+    def test_should_print_row_key_for_hourly_using_naive_datetime(self):
+
+        # returns naive datetime in the local timezone (ie. no timezone info)
+        naive_local_now = datetime.now()
+        utc_now = datetime.utcnow()
+
+        dto = TimestampedDataDTO('test', naive_local_now, 'd', '0')
+
+        row_key = dto.get_row_key_for_hourly()
+
+        print row_key
+
+    def test_should_build_utc_based_row_key_for_hourly_using_timezone_aware_datetime(self):
+
+        # Both should generate the same row key
+        utc_now = datetime.utcnow()
+        local_now = datetime.now(tz=pytz.timezone('US/Eastern'))
+
+        dto = TimestampedDataDTO('test', local_now, 'd', '0')
+        row_key_local_now = dto.get_row_key_for_hourly()
+
+        dto = TimestampedDataDTO('test', utc_now, 'd', '0')
+        row_key_utc_now = dto.get_row_key_for_hourly()
+
+        self.assertEqual(row_key_utc_now, row_key_local_now)
+
+    def test_should_build_utc_epoch_milliseconds_using_timezone_aware_datetime(self):
+
+        # Both should generate the same row key
+        utc_now = datetime.utcnow()
+        local_now = datetime.now(tz=pytz.timezone('US/Eastern'))
+
+        dto = TimestampedDataDTO('test', local_now, 'd', '0')
+        unix_time_millis = dto.timestamp_as_unix_time_millis()
+
+        print unix_time_millis
 
 class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
 

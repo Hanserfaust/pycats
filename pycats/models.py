@@ -1,7 +1,7 @@
-import time
 import pytz
 from datetime import datetime, timedelta
 import random
+import calendar
 
 class TimestampedDataDTO():
     # In case data_value cant be indexed, it will force the indexer to use str_for_index as base for index
@@ -25,19 +25,19 @@ class TimestampedDataDTO():
 
     # A nice hash for the data would be better
     def get_row_key_for_blob_data(self):
-        time_part = str(self.timestamp_as_unix_time_millis(self.timestamp_as_utc()))
+        time_part = str(self.timestamp_as_unix_time_millis())
         return str(self.source_id+'-'+self.data_name+'-'+time_part)
 
     def timestamp_as_utc(self):
         if self.timestamp.tzinfo:
-            return self.timestamp.astimezone (pytz.utc)
+            return self.timestamp.astimezone(pytz.utc)
         else:
             return self.timestamp
 
-    def timestamp_as_unix_time_millis(self, dt=None):
-        if not dt:
-            dt = self.timestamp_as_utc()
-        return long(time.mktime(dt.timetuple())*1e3 + dt.microsecond/1e3)
+    def timestamp_as_unix_time_millis(self):
+        dt = self.timestamp_as_utc()
+        return long(calendar.timegm(dt.utctimetuple())*1e3 + dt.microsecond/1e3)
+        #return long(time.mktime(dt.timetuple())*1e3 + dt.microsecond/1e3)
 
     def __unicode__(self):
         return u'%s from %s : %s=%s' % (self.timestamp, self.source_id, self.data_name, self.data_value)
