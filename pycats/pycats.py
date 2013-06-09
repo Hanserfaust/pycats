@@ -53,7 +53,7 @@ class TimeSeriesCassandraDao():
     def __init__(self, cassandra_hosts, key_space, cache=None, warm_up_cache_shards=0, disable_high_res_column_name_randomization=False, index_depth=5, pool_size=5, prefill=True):
         self.__cassandra_hosts = cassandra_hosts
         self.__key_space = key_space
-        self.__pool = pycassa.ConnectionPool(self.__key_space, self.__cassandra_hosts, pool_size=pool_size, prefill=prefill)
+        self.__pool = pycassa.ConnectionPool(self.__key_space, self.__cassandra_hosts, pool_size=0, prefill=False)
         self.cache = cache
         self.cache_hits = 0
         self.daily_gets = 0
