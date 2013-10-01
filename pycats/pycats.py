@@ -62,6 +62,9 @@ class TimeSeriesCassandraDao():
         self.blob_indexer = indexers.StringIndexer(index_depth)
         self.disable_high_res_column_name_randomization = disable_high_res_column_name_randomization
 
+    def dispose(self):
+        self.__pool.dispose()
+
     def __get_hourly_data_cf(self):
         return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME)
 
