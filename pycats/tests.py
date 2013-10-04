@@ -221,6 +221,27 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
             self.assertEqual(result[i][0], values_inserted[i].timestamp)
             self.assertEqual(result[i][1], values_inserted[i].data_value)
 
+    # NOTE: dash (-) in source_id and test_metric to test that it does not disturb pycats row-key model
+    def test_should_load_all_data_by_generator_for_full_range_using_single_insert(self):
+        source_id = 'unittest2-'
+        test_metric = 'ramp-height'
+        start_datetime = datetime.strptime('1979-12-31T22:00:00', '%Y-%m-%dT%H:%M:%S')
+        end_datetime = datetime.strptime('1980-01-02T03:00:00', '%Y-%m-%dT%H:%M:%S')
+
+        values_inserted = self.__insert_range_of_metrics(source_id, test_metric, start_datetime, end_datetime, batch_insert=False)
+
+        # Should miss the first and last values
+        result = self.dao.get_timetamped_data_range_generator(source_id, test_metric, start_datetime, end_datetime)
+
+        i = 0
+        for item in result:
+            self.assertEqual(item[0], values_inserted[i].timestamp)
+            self.assertEqual(item[1], values_inserted[i].data_value)
+            i = i + 1
+
+        # Assert length
+        self.assertEqual(i, len(values_inserted))
+
     def test_should_load_all_data_for_data_range_with_no_data_in_some_hours(self):
         source_id = 'unittest2_4'
         test_metric = 'ramp_height'

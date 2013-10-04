@@ -358,12 +358,7 @@ class TimeSeriesCassandraDao():
         except NotFoundException:
             return (row_key, {})
 
-    # Load data for given metric_name, a start and end datetime and source_id
-    #
-    # Note that max_count referres to the maximum size of the total result.
-    #
-    # Never asume the whole range will be fetched. Call will returned when max_count is reached.
-    def get_timetamped_data_range(self, source_id, metric_name, start_datetime, end_datetime, max_count=MAX_TIME_SERIES_COLUMN_COUNT, allow_cached_loads=False):
+    def data_generator(self, source_id, metric_name, start_datetime, end_datetime, max_count=MAX_TIME_SERIES_COLUMN_COUNT, allow_cached_loads=False):
 
         # TODO: check requested range, or check how many shards we will request
         # should probably put a limit here
@@ -380,16 +375,15 @@ class TimeSeriesCassandraDao():
             curr += timedelta(hours=1)
 
         # load the hourly shards
-        result = list()
-        shards = list()
-        key_to_last_shard = None
+        #shards = list()
+        #key_to_last_shard = None
 
         if len(datetimes) == 0:
-            return []
+            yield []
         if len(datetimes) == 1:
             row_key = TimestampedDataDTO( source_id, datetimes[0], metric_name, None).get_row_key_for_hourly()
             shard = self.__load_shard(row_key, start_datetime, end_datetime)
-            shards.append(shard)
+            yield shard
         if len(datetimes) > 1:
             for i in range(0, len(datetimes)):
                 if maximum_allowed <= 0 :
@@ -403,7 +397,7 @@ class TimeSeriesCassandraDao():
                 else:
                     a_shard = self.__load_shard(row_key, datetimes[len(datetimes)-1], end_datetime+timedelta(microseconds=1), maximum_allowed, allow_cached_loads)
                 maximum_allowed -= len(a_shard[1])
-                shards.append(a_shard)
+                yield a_shard
 
         # Avoid multiget for now due to uncertainty of the column_count meaning. We dont want to fetch the 100 first of many slices,
         # leaving us with holes in the data series we are fetching
@@ -414,17 +408,38 @@ class TimeSeriesCassandraDao():
         #    # Check if any of the shards was limited
         #    shards.extend(multi_get_result.items())
 
+    # Load data for given metric_name, a start and end datetime and source_id
+    #
+    # Note that max_count referres to the maximum size of the total result.
+    #
+    # Never asume the whole range will be fetched. Call will returned when max_count is reached.
+    def get_timetamped_data_range(self, source_id, metric_name, start_datetime, end_datetime, max_count=MAX_TIME_SERIES_COLUMN_COUNT, allow_cached_loads=False):
+        result = list()
+
         # Shards contain hourly data.. need to straighten it out and convert the high-res timestamp
-        for shard in shards:
+        for shard in self.data_generator(source_id, metric_name, start_datetime, end_datetime, max_count, allow_cached_loads):
             if not shard:
                 continue
             row_key = shard[0]
             # Restore date from rowkey and column name (which is pico-time offset).. this is wierd... but it works
             floored_datetime_from_key = row_key.split('-')[-1]
             floored_datetime = datetime.strptime(floored_datetime_from_key, '%Y%m%d%H')
-            datetimes_and_values = shard[1].items()
-            for tuple in datetimes_and_values:
-                the_datetime = self.highres_to_utc_datetime(floored_datetime, tuple[0])
-                result.append((the_datetime, tuple[1]))
+            for (offset, value) in shard[1].items():
+                the_datetime = self.highres_to_utc_datetime(floored_datetime, offset)
+                result.append((the_datetime, value))
 
         return result
+
+    def get_timetamped_data_range_generator(self, source_id, metric_name, start_datetime, end_datetime, max_count=MAX_TIME_SERIES_COLUMN_COUNT, allow_cached_loads=False):
+
+        # Shards contain hourly data.. need to straighten it out and convert the high-res timestamp
+        for shard in self.data_generator(source_id, metric_name, start_datetime, end_datetime, max_count, allow_cached_loads):
+            if not shard:
+                continue
+            row_key = shard[0]
+            # Restore date from rowkey and column name (which is pico-time offset).. this is wierd... but it works
+            floored_datetime_from_key = row_key.split('-')[-1]
+            floored_datetime = datetime.strptime(floored_datetime_from_key, '%Y%m%d%H')
+            for (offset, value) in shard[1].items():
+                the_datetime = self.highres_to_utc_datetime(floored_datetime, offset)
+                yield (the_datetime, value)
