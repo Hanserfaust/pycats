@@ -66,17 +66,29 @@ class TimeSeriesCassandraDao():
     def dispose(self):
         self.__pool.dispose()
 
+    hourly_data_cf = None
     def __get_hourly_data_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME)
+        if self.hourly_data_cf is None:
+            self.hourly_data_cf = pycassa.ColumnFamily(self.__pool, self.HOURLY_DATA_COLUMN_FAMILY_NAME)
+        return self.hourly_data_cf
 
+    latest_data_cf = None
     def __get_latest_data_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.LATEST_DATA_COLUMN_FAMILY_NAME)
+        if self.latest_data_cf is None:
+            self.latest_data_cf = pycassa.ColumnFamily(self.__pool, self.LATEST_DATA_COLUMN_FAMILY_NAME)
+        return self.latest_data_cf
 
+    blob_data_cf = None
     def __get_blob_data_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.BLOB_DATA_COLUMN_FAMILY_NAME)
+        if self.blob_data_cf is None:
+            self.blob_data_cf = pycassa.ColumnFamily(self.__pool, self.BLOB_DATA_COLUMN_FAMILY_NAME)
+        return self.blob_data_cf
 
+    blob_data_index_cf = None
     def __get_blob_data_index_cf(self):
-        return pycassa.ColumnFamily(self.__pool, self.BLOB_DATA_INDEX_COLUMN_FAMILY_NAME)
+        if self.blob_data_index_cf is None:
+            self.blob_data_index_cf = pycassa.ColumnFamily(self.__pool, self.BLOB_DATA_INDEX_COLUMN_FAMILY_NAME)
+        return self.blob_data_index_cf
 
     # Convert datetime object to millisecond precision unix epoch
 #    def __unix_time_millis(self, dt):
