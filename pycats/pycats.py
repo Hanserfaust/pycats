@@ -181,9 +181,16 @@ class TimeSeriesCassandraDao():
     def create_insert_dict_for_latest_data(self, data_name, data_value, timestamp):
         return  {data_name : data_value, data_name+'-ts' : str(timestamp)}
 
-    def insert_latest_data(self, dto, verify_timestamp=True):
+    # Provide the batch_dict to only have the dict filled up
+    # then execute a batch insert on that dict for fastest performance
+    # for even higher performance, set verify_timestamp=False
+    def insert_latest_data(self, dto, verify_timestamp=True, batch_dict=None):
         last_ts = 0
         this_ts = dto.timestamp_as_unix_time_millis()
+
+        #
+        # Will only insert if the new data has a timestamp new than in DB
+        # NOTE: very costly operation
         if verify_timestamp:
             try:
                 last_latest_data = self.load_latest_data(dto.source_id)
@@ -198,7 +205,11 @@ class TimeSeriesCassandraDao():
                 # could not parse the timestamp, format may have change?
                 last_ts = 0
         if this_ts > last_ts:
-            self.__get_latest_data_cf().insert(dto.source_id, self.create_insert_dict_for_latest_data(dto.data_name, dto.data_value, this_ts))
+            if batch_dict:
+                batch_dict[dto.source_id] = self.create_insert_dict_for_latest_data(dto.data_name, dto.data_value, this_ts)
+            else:
+                self.__get_latest_data_cf().insert(dto.source_id, self.create_insert_dict_for_latest_data(dto.data_name, dto.data_value, this_ts))
+
 
     # Will force insert a dictionary of data using UTC now as timestamp
     def insert_latest_data_by_dict(self, source_id, data_dict):
@@ -219,22 +230,24 @@ class TimeSeriesCassandraDao():
 
     # Will only insert into the shards
     def batch_insert_timestamped_data(self, list_of_timestamped_data_dtos, ttl=None, set_latest=False):
-        hourly_insert_dict = dict()
+        hourly_batch_dict = dict()
 
         for dto in list_of_timestamped_data_dtos:
             hourly_shard_row_key = dto.get_row_key_for_hourly()
-            col_name_value_pairs = hourly_insert_dict.get(hourly_shard_row_key, None)
+            col_name_value_pairs = hourly_batch_dict.get(hourly_shard_row_key, None)
             if not col_name_value_pairs:
                 col_name_value_pairs = dict()
             column_name = self.get_high_res_column_name(dto.timestamp_as_utc())
             col_name_value_pairs[column_name] = dto.data_value
-            hourly_insert_dict[hourly_shard_row_key] = col_name_value_pairs
+            hourly_batch_dict[hourly_shard_row_key] = col_name_value_pairs
 
+        latest_batch_dict = dict()
         if set_latest:
             for dto in list_of_timestamped_data_dtos:
-                self.insert_latest_data(dto)
+                self.insert_latest_data(dto, verify_timestamp=False, batch_dict=latest_batch_dict)
 
-        self.__get_hourly_data_cf().batch_insert(hourly_insert_dict, ttl=ttl)
+        self.__get_latest_data_cf().batch_insert(latest_batch_dict)
+        self.__get_hourly_data_cf().batch_insert(hourly_batch_dict, ttl=ttl)
 
     def insert_blob_data(self, blob_data_dto, ttl=None):
         row_key = blob_data_dto.get_row_key_for_blob_data()

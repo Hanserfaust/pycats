@@ -231,10 +231,10 @@ class TimeSeriesCassandraDaoIntegrationTest(PyCatsIntegrationTestBase):
         values_inserted = self.__insert_range_of_metrics(source_id, test_metric, start_datetime, end_datetime, batch_insert=False)
 
         # Should miss the first and last values
-        result = self.dao.get_timetamped_data_range_generator(source_id, test_metric, start_datetime, end_datetime)
+        data_gen = self.dao.get_timetamped_data_range_generator(source_id, test_metric, start_datetime, end_datetime)
 
         i = 0
-        for item in result:
+        for item in data_gen:
             self.assertEqual(item[0], values_inserted[i].timestamp)
             self.assertEqual(item[1], values_inserted[i].data_value)
             i = i + 1
